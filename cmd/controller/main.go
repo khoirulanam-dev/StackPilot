@@ -2,6 +2,7 @@ package main
 
 import (
 	"context"
+	"fmt"
 	"log/slog"
 	"os"
 	"os/signal"
@@ -10,13 +11,29 @@ import (
 )
 
 func main() {
-	logger := slog.New(slog.NewTextHandler(os.Stdout, nil))
+	if err := run(); err != nil {
+		fmt.Fprintf(os.Stderr, "controller startup error: %v\n", err)
+		os.Exit(1)
+	}
+}
+
+func run() error {
+	cfg, err := controller.LoadConfig()
+	if err != nil {
+		return err
+	}
+
+	logger := slog.New(slog.NewTextHandler(os.Stdout, &slog.HandlerOptions{
+		Level: cfg.LogLevel,
+	}))
+
+	logger.Info("starting stackpilot controller",
+		"listen_address", cfg.ListenAddress,
+		"log_level", cfg.LogLevel.String(),
+	)
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	if err := controller.Run(ctx, logger); err != nil {
-		logger.Error("controller error", "error", err)
-		os.Exit(1)
-	}
+	return controller.Run(ctx, cfg, logger)
 }

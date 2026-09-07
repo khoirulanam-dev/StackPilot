@@ -3,7 +3,9 @@ package controller
 import (
 	"context"
 	"errors"
+	"fmt"
 	"log/slog"
+	"net"
 	"net/http"
 	"time"
 )
@@ -25,10 +27,8 @@ func newHandler(logger *slog.Logger) http.Handler {
 	return mux
 }
 
-// Run starts the controller components and blocks until ctx is canceled.
-func Run(ctx context.Context, logger *slog.Logger) error {
+func serve(ctx context.Context, l net.Listener, logger *slog.Logger) error {
 	srv := &http.Server{
-		Addr:              "127.0.0.1:7447",
 		Handler:           newHandler(logger),
 		ReadHeaderTimeout: 5 * time.Second,
 		ReadTimeout:       10 * time.Second,
@@ -38,18 +38,37 @@ func Run(ctx context.Context, logger *slog.Logger) error {
 
 	errCh := make(chan error, 1)
 	go func() {
-		if err := srv.ListenAndServe(); err != nil && !errors.Is(err, http.ErrServerClosed) {
-			errCh <- err
-		}
-		close(errCh)
+		errCh <- srv.Serve(l)
 	}()
 
 	select {
 	case err := <-errCh:
+		if errors.Is(err, http.ErrServerClosed) {
+			return nil
+		}
 		return err
 	case <-ctx.Done():
 		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
 		defer cancel()
-		return srv.Shutdown(shutdownCtx)
+		shutdownErr := srv.Shutdown(shutdownCtx)
+		serveErr := <-errCh
+		if serveErr != nil && !errors.Is(serveErr, http.ErrServerClosed) {
+			return serveErr
+		}
+		return shutdownErr
 	}
+}
+
+// Run starts the controller components and blocks until ctx is canceled.
+func Run(ctx context.Context, cfg Config, logger *slog.Logger) error {
+	if err := cfg.validate(); err != nil {
+		return fmt.Errorf("invalid controller configuration: %w", err)
+	}
+
+	l, err := net.Listen("tcp", cfg.ListenAddress)
+	if err != nil {
+		return fmt.Errorf("failed to listen on %s: %w", cfg.ListenAddress, err)
+	}
+
+	return serve(ctx, l, logger)
 }

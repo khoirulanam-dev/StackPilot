@@ -5,7 +5,7 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.1 stage, which establishes the repository foundation. It is **NOT** production-ready.
+StackPilot is currently in the M0.2 stage (Controller Configuration & Runtime Foundation). It is **NOT** production-ready.
 
 ## Development
 To build the project locally, you need Go 1.27.1, Node.js 24 LTS, and the frontend package manager version pinned in web/package.json.
@@ -20,6 +20,11 @@ make test
 # Build frontend
 make web-build
 ```
+
+### Controller Configuration
+The controller supports the following environment variables:
+- `STACKPILOT_LISTEN_ADDRESS` (default: `127.0.0.1:7447`): HTTP listen address (`host:port`). Accepts literal loopback IP and port only; remote and wildcard addresses are rejected while authentication is not implemented.
+- `STACKPILOT_LOG_LEVEL` (default: `info`): Logging verbosity (`debug`, `info`, `warn`, `error`).
 
 ## Security
 StackPilot is designed to be security-first. Please see [SECURITY.md](SECURITY.md) for vulnerability reporting guidelines.
