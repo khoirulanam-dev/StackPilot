@@ -1,0 +1,63 @@
+name: CI
+
+on:
+  push:
+    branches: [ main ]
+  pull_request:
+    branches: [ main ]
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Checkout code
+        uses: actions/checkout@3d3c42e5aac5ba805825da76410c181273ba90b1 # v7.0.1
+        with:
+          persist-credentials: false
+
+      - name: Setup Go
+        uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e # v7.0.0
+        with:
+          go-version-file: go.mod
+
+      - name: Verify Go Formatting
+        run: |
+          if [ -n "$(gofmt -l .)" ]; then
+            echo "Go code is not formatted:"
+            gofmt -l .
+            exit 1
+          fi
+
+      - name: Go Vet
+        run: go vet ./...
+
+      - name: Go Test
+        run: go test ./...
+
+      - name: Go Test Race
+        run: go test -race ./...
+
+      - name: Go Build Controller
+        run: go build -o build/stackpilot-controller ./cmd/controller
+
+      - name: Go Build Agent
+        run: go build -o build/stackpilot-agent ./cmd/agent
+
+      - name: Setup pnpm
+        uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0
+        with:
+          working-directory: web
+          runtime: node@24
+          require-lockfile: true
+          install: false
+
+      - name: Install Frontend Dependencies
+        working-directory: web
+        run: pnpm install --frozen-lockfile
+
+      - name: Build Frontend
+        working-directory: web
+        run: pnpm build
