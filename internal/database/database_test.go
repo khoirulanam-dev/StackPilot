@@ -135,3 +135,12 @@ func TestFindAgentByPublicKey_Uninitialized(t *testing.T) {
 		t.Fatal("expected error on uninitialized pool, got nil")
 	}
 }
+
+func TestRecordAgentHeartbeat_Uninitialized(t *testing.T) {
+	db := &DB{}
+	var key [32]byte
+	_, err := db.RecordAgentHeartbeat(context.Background(), key, 1)
+	if err == nil {
+		t.Fatal("expected error on uninitialized pool, got nil")
+	}
+}

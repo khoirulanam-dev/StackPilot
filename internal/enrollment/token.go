@@ -32,9 +32,11 @@ var (
 
 // AgentRecord represents safe domain metadata for an enrolled Agent.
 type AgentRecord struct {
-	ID        string
-	PublicKey [32]byte
-	CreatedAt time.Time
+	ID              string
+	PublicKey       [32]byte
+	CreatedAt       time.Time
+	LastSeenAt      *time.Time
+	ProtocolVersion *int
 }
 
 // AgentRegistrar defines the contract for atomic token consumption and Agent registration.
@@ -45,6 +47,11 @@ type AgentRegistrar interface {
 // AgentFinder defines the contract for looking up an Agent by public key.
 type AgentFinder interface {
 	FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*AgentRecord, error)
+}
+
+// AgentHeartbeatRecorder defines the contract for recording an Agent heartbeat.
+type AgentHeartbeatRecorder interface {
+	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*AgentRecord, error)
 }
 
 // TokenRecord represents safe metadata returned after persisting an enrollment token.

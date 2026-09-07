@@ -1,6 +1,7 @@
 package controller
 
 import (
+	"bytes"
 	"context"
 	"crypto/ed25519"
 	"crypto/tls"
@@ -18,6 +19,7 @@ import (
 	"time"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/protocol"
 )
 
 type readinessChecker interface {
@@ -30,6 +32,7 @@ type enrollmentRegistrar interface {
 
 type agentAuthenticator interface {
 	FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*enrollment.AgentRecord, error)
+	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error)
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -199,6 +202,43 @@ func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollm
 	return mux
 }
 
+var errAuthFailed = errors.New("agent authentication failed")
+
+func extractAuthenticatedPeerPublicKey(r *http.Request) ([32]byte, error) {
+	if r.TLS == nil || len(r.TLS.PeerCertificates) == 0 {
+		return [32]byte{}, errAuthFailed
+	}
+
+	cert := r.TLS.PeerCertificates[0]
+
+	now := time.Now()
+	if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+		return [32]byte{}, errAuthFailed
+	}
+
+	if len(cert.ExtKeyUsage) > 0 {
+		hasClientAuth := false
+		for _, eku := range cert.ExtKeyUsage {
+			if eku == x509.ExtKeyUsageClientAuth {
+				hasClientAuth = true
+				break
+			}
+		}
+		if !hasClientAuth {
+			return [32]byte{}, errAuthFailed
+		}
+	}
+
+	edPubKey, ok := cert.PublicKey.(ed25519.PublicKey)
+	if !ok || len(edPubKey) != ed25519.PublicKeySize {
+		return [32]byte{}, errAuthFailed
+	}
+
+	var pubKey [32]byte
+	copy(pubKey[:], edPubKey)
+	return pubKey, nil
+}
+
 func newRemoteHandler(logger *slog.Logger, registrar enrollmentRegistrar, authenticator agentAuthenticator) http.Handler {
 	mux := http.NewServeMux()
 
@@ -222,41 +262,11 @@ func newRemoteHandler(logger *slog.Logger, registrar enrollmentRegistrar, authen
 			return
 		}
 
-		if len(r.TLS.PeerCertificates) == 0 {
+		pubKey, err := extractAuthenticatedPeerPublicKey(r)
+		if err != nil {
 			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
 			return
 		}
-
-		cert := r.TLS.PeerCertificates[0]
-
-		now := time.Now()
-		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
-			return
-		}
-
-		if len(cert.ExtKeyUsage) > 0 {
-			hasClientAuth := false
-			for _, eku := range cert.ExtKeyUsage {
-				if eku == x509.ExtKeyUsageClientAuth {
-					hasClientAuth = true
-					break
-				}
-			}
-			if !hasClientAuth {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
-				return
-			}
-		}
-
-		edPubKey, ok := cert.PublicKey.(ed25519.PublicKey)
-		if !ok || len(edPubKey) != ed25519.PublicKeySize {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
-			return
-		}
-
-		var pubKey [32]byte
-		copy(pubKey[:], edPubKey)
 
 		if authenticator == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
@@ -280,6 +290,91 @@ func newRemoteHandler(logger *slog.Logger, registrar enrollmentRegistrar, authen
 		writeJSON(w, http.StatusOK, map[string]string{
 			"agent_id": record.ID,
 		})
+	})
+
+	mux.HandleFunc(protocol.HeartbeatEndpointPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tls required"})
+			return
+		}
+
+		if r.Method != http.MethodPost {
+			w.Header().Set("Allow", "POST")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		pubKey, err := extractAuthenticatedPeerPublicKey(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
+			return
+		}
+
+		ct := r.Header.Get("Content-Type")
+		mediaType, params, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid content type"})
+			return
+		}
+		if charset, ok := params["charset"]; ok && strings.ToLower(charset) != "utf-8" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported charset"})
+			return
+		}
+
+		limited := io.LimitReader(r.Body, 1025)
+		bodyBytes, err := io.ReadAll(limited)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+			return
+		}
+		if len(bodyBytes) > 1024 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			return
+		}
+
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.DisallowUnknownFields()
+		var req protocol.HeartbeatRequest
+		if err := dec.Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trailing data in request body"})
+			return
+		}
+
+		if req.ProtocolVersion <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid protocol version"})
+			return
+		}
+		if req.ProtocolVersion != protocol.CurrentVersion {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "unsupported agent protocol"})
+			return
+		}
+
+		if authenticator == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
+			return
+		}
+
+		dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		_, err = authenticator.RecordAgentHeartbeat(dbCtx, pubKey, req.ProtocolVersion)
+		if err != nil {
+			if errors.Is(err, enrollment.ErrAgentNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
+				return
+			}
+			logger.Error("agent heartbeat database failure")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+			return
+		}
+
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
 	})
 
 	return mux

@@ -9,6 +9,7 @@ import (
 	"log/slog"
 	"os"
 	"os/signal"
+	"strings"
 	"syscall"
 
 	"stackpilot/internal/agent"
@@ -22,8 +23,8 @@ func main() {
 }
 
 func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
-	if len(args) == 0 {
-		return runAgentDaemon(stdout)
+	if len(args) == 0 || strings.HasPrefix(args[0], "-") {
+		return runAgentDaemon(args, stdout, stderr)
 	}
 
 	switch args[0] {
@@ -36,12 +37,29 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 }
 
-func runAgentDaemon(stdout io.Writer) error {
+func runAgentDaemon(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("stackpilot-agent", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	stateDir := fs.String("state-dir", "", "Agent state directory containing enrolled cryptographic identity")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if fs.NArg() > 0 {
+		return errors.New("unexpected positional arguments")
+	}
+
+	if *stateDir == "" {
+		return fmt.Errorf("missing required flag --state-dir")
+	}
+
 	logger := slog.New(slog.NewTextHandler(stdout, nil))
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return agent.Run(ctx, logger)
+	return agent.Run(ctx, logger, *stateDir)
 }
 
 func runEnroll(args []string, stdin io.Reader, stdout, stderr io.Writer) error {

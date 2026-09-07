@@ -239,14 +239,52 @@ func TestAgentCLI_Dispatch(t *testing.T) {
 		}
 	})
 
+	t.Run("daemon missing state-dir returns error", func(t *testing.T) {
+		err := run([]string{}, stdin, stdout, stderr)
+		if err == nil {
+			t.Fatal("expected error for daemon without flags, got nil")
+		}
+		if !strings.Contains(err.Error(), "--state-dir") {
+			t.Errorf("expected error to mention '--state-dir', got %q", err.Error())
+		}
+	})
+
+	t.Run("daemon positional arguments rejected", func(t *testing.T) {
+		err := run([]string{"--state-dir", "/tmp/foo", "unexpected"}, stdin, stdout, stderr)
+		if err == nil {
+			t.Fatal("expected error for daemon positional arguments, got nil")
+		}
+		if !strings.Contains(err.Error(), "unexpected positional arguments") {
+			t.Errorf("expected error to mention unexpected positional arguments, got %q", err.Error())
+		}
+	})
+
 	t.Run("daemon mode cancellation", func(t *testing.T) {
 		ctx, cancel := context.WithCancel(context.Background())
-		outBuf := &bytes.Buffer{}
+		tempDir := t.TempDir()
+		stateDir := filepath.Join(tempDir, "state")
+		if err := agent.EnsureStateDir(stateDir); err != nil {
+			t.Fatalf("failed to ensure state dir: %v", err)
+		}
+		pub, _, err := agent.LoadOrGenerateKey(stateDir, rand.Reader)
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		meta := &agent.IdentityMetadata{
+			Version:       1,
+			AgentID:       "018f0000-0000-7000-8000-000000000004",
+			ControllerURL: "https://127.0.0.1:7448",
+			PublicKey:     agent.FormatPublicKeyBase64RawURL(pub),
+		}
+		if err := agent.WriteIdentityMetadata(stateDir, meta); err != nil {
+			t.Fatalf("failed to write identity metadata: %v", err)
+		}
+
 		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 		done := make(chan error, 1)
 		go func() {
-			done <- agent.Run(ctx, logger)
+			done <- agent.Run(ctx, logger, stateDir)
 		}()
 
 		// Cancel context shortly
@@ -260,6 +298,5 @@ func TestAgentCLI_Dispatch(t *testing.T) {
 		case <-time.After(2 * time.Second):
 			t.Fatal("agent daemon did not exit within timeout")
 		}
-		_ = outBuf
 	})
 }

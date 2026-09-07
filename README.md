@@ -5,10 +5,11 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.6 stage (Secure Remote Agent Transport). It is pre-release and **NOT** production-ready.
-- No heartbeat yet
+StackPilot is currently in the M0.7 stage (Agent Presence & Heartbeat Foundation). It is pre-release and **NOT** production-ready.
 - No inventory
+- No metrics
 - No remote commands
+- No UI
 
 ## Development
 To build and test the project locally, you need:
@@ -64,6 +65,19 @@ The enrollment token still comes from stdin.
 ```bash
 stackpilot-agent transport-check --state-dir /path/state
 ```
+
+#### Run Agent Presence Daemon
+```bash
+stackpilot-agent --state-dir /path/state
+```
+
+Behavior:
+- Sends an immediate authenticated presence heartbeat on startup
+- Maintains presence via periodic heartbeats at ~30-second intervals with jitter (±10%)
+- Reconnects with bounded exponential backoff on transient errors (1s to 30s cap)
+- Automatically rotates in-memory ephemeral TLS client certificate before 1-hour expiration
+- Reuses TLS identity established during M0.6 enrollment without requiring extra flags
+- Controller maintains `last_seen_at` (database time) and `protocol_version` in PostgreSQL
 
 * Token is read from stdin and never written to disk.
 * Agent generates and stores an Ed25519 private key in `--state-dir` with restrictive permissions (mode `0600`).

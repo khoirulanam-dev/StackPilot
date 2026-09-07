@@ -239,18 +239,20 @@ func (db *DB) FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*en
 	}
 
 	const query = `
-		SELECT id::text, public_key, created_at
+		SELECT id::text, public_key, created_at, last_seen_at, protocol_version
 		FROM stackpilot.agents
 		WHERE public_key = $1
 	`
 
 	var (
-		id        string
-		pubKey    []byte
-		createdAt time.Time
+		id              string
+		pubKey          []byte
+		createdAt       time.Time
+		lastSeenAt      *time.Time
+		protocolVersion *int
 	)
 
-	err := db.pool.QueryRow(ctx, query, publicKey[:]).Scan(&id, &pubKey, &createdAt)
+	err := db.pool.QueryRow(ctx, query, publicKey[:]).Scan(&id, &pubKey, &createdAt, &lastSeenAt, &protocolVersion)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return nil, enrollment.ErrAgentNotFound
@@ -266,9 +268,50 @@ func (db *DB) FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*en
 	copy(pub[:], pubKey)
 
 	return &enrollment.AgentRecord{
-		ID:        id,
-		PublicKey: pub,
-		CreatedAt: createdAt,
+		ID:              id,
+		PublicKey:       pub,
+		CreatedAt:       createdAt,
+		LastSeenAt:      lastSeenAt,
+		ProtocolVersion: protocolVersion,
+	}, nil
+}
+
+// RecordAgentHeartbeat updates the agent's presence timestamp to database now() and records protocol_version.
+func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	const query = `
+		UPDATE stackpilot.agents
+		SET
+			last_seen_at = now(),
+			protocol_version = $2
+		WHERE public_key = $1
+		RETURNING id::text, created_at, last_seen_at, protocol_version
+	`
+
+	var (
+		id                     string
+		createdAt              time.Time
+		lastSeenAt             *time.Time
+		protocolVersionScanned *int
+	)
+
+	err := db.pool.QueryRow(ctx, query, publicKey[:], protocolVersion).Scan(&id, &createdAt, &lastSeenAt, &protocolVersionScanned)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, enrollment.ErrAgentNotFound
+		}
+		return nil, fmt.Errorf("failed to record agent heartbeat: %w", sanitizeError(err))
+	}
+
+	return &enrollment.AgentRecord{
+		ID:              id,
+		PublicKey:       publicKey,
+		CreatedAt:       createdAt,
+		LastSeenAt:      lastSeenAt,
+		ProtocolVersion: protocolVersionScanned,
 	}, nil
 }
 

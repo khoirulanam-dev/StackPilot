@@ -50,14 +50,14 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 3 (migrations 001, 002, 003 applied)
+	// 5. Verify migration version is 4 (migrations 001, 002, 003, 004 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("expected schema version 3, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected schema version 4, got %d", version)
 	}
 
 	// 6. Run migration again (verify idempotence)
@@ -65,13 +65,13 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("second migration run failed: %v", err)
 	}
 
-	// 7. Verify version remains 3
+	// 7. Verify version remains 4
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 3 {
-		t.Fatalf("expected schema version to remain 3, got %d", version)
+	if version != 4 {
+		t.Fatalf("expected schema version to remain 4, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -146,6 +146,8 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		"public_key":          true,
 		"enrollment_token_id": true,
 		"created_at":          true,
+		"last_seen_at":        true,
+		"protocol_version":    true,
 	}
 	if len(agentColumns) != len(expectedAgentColumns) {
 		t.Fatalf("expected %d columns in agents, got %d: %v", len(expectedAgentColumns), len(agentColumns), agentColumns)
@@ -386,6 +388,86 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 	if !errors.Is(err, enrollment.ErrAgentNotFound) {
 		t.Fatalf("expected ErrAgentNotFound, got: %v", err)
+	}
+
+	// 17. M0.7: Presence & Heartbeat Foundation
+	// 17a. Create a fresh randomized Agent for heartbeat testing
+	plaintextTokenH, err := enrollment.IssueToken(ctx, db)
+	if err != nil {
+		t.Fatalf("failed to issue enrollment token for agentH: %v", err)
+	}
+	hashH := enrollment.HashToken(plaintextTokenH)
+
+	pubKeyH, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key for agentH: %v", err)
+	}
+	var keyH [32]byte
+	copy(keyH[:], pubKeyH)
+
+	agentH, createdH, err := db.RegisterAgent(ctx, hashH, keyH)
+	if err != nil || !createdH {
+		t.Fatalf("failed to register agentH: %v", err)
+	}
+
+	// Verify before heartbeat: last_seen_at IS NULL, protocol_version IS NULL
+	foundBeforeH, err := db.FindAgentByPublicKey(ctx, keyH)
+	if err != nil {
+		t.Fatalf("failed to lookup agentH before heartbeat: %v", err)
+	}
+	if foundBeforeH.LastSeenAt != nil {
+		t.Fatalf("expected last_seen_at to be nil before first heartbeat, got %v", foundBeforeH.LastSeenAt)
+	}
+	if foundBeforeH.ProtocolVersion != nil {
+		t.Fatalf("expected protocol_version to be nil before first heartbeat, got %v", foundBeforeH.ProtocolVersion)
+	}
+
+	// Record first heartbeat with protocol_version 1
+	recH1, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
+	if err != nil {
+		t.Fatalf("RecordAgentHeartbeat failed on first heartbeat: %v", err)
+	}
+	if recH1.ID != agentH.ID {
+		t.Fatalf("expected agent ID %q, got %q", agentH.ID, recH1.ID)
+	}
+	if recH1.LastSeenAt == nil {
+		t.Fatal("expected last_seen_at to be non-nil after first heartbeat")
+	}
+	if recH1.ProtocolVersion == nil || *recH1.ProtocolVersion != 1 {
+		t.Fatalf("expected protocol_version to be 1, got %v", recH1.ProtocolVersion)
+	}
+
+	firstSeenAt := *recH1.LastSeenAt
+
+	// Record second heartbeat
+	recH2, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
+	if err != nil {
+		t.Fatalf("RecordAgentHeartbeat failed on second heartbeat: %v", err)
+	}
+	if recH2.LastSeenAt == nil {
+		t.Fatal("expected last_seen_at to be non-nil after second heartbeat")
+	}
+	if recH2.LastSeenAt.Before(firstSeenAt) {
+		t.Fatalf("expected second last_seen_at (%v) to be >= first (%v)", recH2.LastSeenAt, firstSeenAt)
+	}
+
+	// 17b. Unknown public key heartbeat returns safe ErrAgentNotFound
+	pubKeyUnknownH, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate random key: %v", err)
+	}
+	var keyUnknownH [32]byte
+	copy(keyUnknownH[:], pubKeyUnknownH)
+
+	_, err = db.RecordAgentHeartbeat(ctx, keyUnknownH, 1)
+	if err == nil {
+		t.Fatal("expected error for unknown public key heartbeat, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrAgentNotFound) {
+		t.Fatalf("expected ErrAgentNotFound for unknown public key heartbeat, got %v", err)
+	}
+	if strings.Contains(err.Error(), "pgx") || strings.Contains(err.Error(), "sql") {
+		t.Fatalf("raw pgx/sql error leaked in error message: %v", err)
 	}
 
 	// Ensure database created_at is reasonable

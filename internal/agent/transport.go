@@ -93,6 +93,11 @@ func BuildEphemeralClientCert(priv ed25519.PrivateKey) (tls.Certificate, error) 
 	return buildEphemeralClientCertWithSource(priv, rand.Reader, time.Now)
 }
 
+const (
+	DefaultCertLifetime      = 1 * time.Hour
+	DefaultCertRefreshMargin = 10 * time.Minute
+)
+
 func buildEphemeralClientCertWithSource(priv ed25519.PrivateKey, r io.Reader, nowFunc func() time.Time) (tls.Certificate, error) {
 	if len(priv) != ed25519.PrivateKeySize {
 		return tls.Certificate{}, ErrInvalidPrivateKey
@@ -118,7 +123,7 @@ func buildEphemeralClientCertWithSource(priv ed25519.PrivateKey, r io.Reader, no
 	template := x509.Certificate{
 		SerialNumber:          serial,
 		NotBefore:             now.Add(-5 * time.Minute),
-		NotAfter:              now.Add(1 * time.Hour),
+		NotAfter:              now.Add(DefaultCertLifetime),
 		KeyUsage:              x509.KeyUsageDigitalSignature,
 		ExtKeyUsage:           []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth},
 		BasicConstraintsValid: true,
@@ -130,9 +135,15 @@ func buildEphemeralClientCertWithSource(priv ed25519.PrivateKey, r io.Reader, no
 		return tls.Certificate{}, fmt.Errorf("failed to create client certificate: %w", err)
 	}
 
+	parsed, err := x509.ParseCertificate(derBytes)
+	if err != nil {
+		return tls.Certificate{}, fmt.Errorf("failed to parse client certificate: %w", err)
+	}
+
 	return tls.Certificate{
 		Certificate: [][]byte{derBytes},
 		PrivateKey:  priv,
+		Leaf:        parsed,
 	}, nil
 }
 

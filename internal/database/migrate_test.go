@@ -11,14 +11,15 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatalf("getEmbeddedMigrations() failed: %v", err)
 	}
 
-	if len(migrations) != 3 {
-		t.Fatalf("expected exactly 3 migrations, got %d", len(migrations))
+	if len(migrations) != 4 {
+		t.Fatalf("expected exactly 4 migrations, got %d", len(migrations))
 	}
 
 	// Verify exact migration order
 	expected001 := "001_create_stackpilot_schema.sql"
 	expected002 := "002_create_enrollment_tokens.sql"
 	expected003 := "003_create_agents.sql"
+	expected004 := "004_add_agent_presence.sql"
 
 	if migrations[0] != expected001 {
 		t.Errorf("expected first migration %q, got %q", expected001, migrations[0])
@@ -28,6 +29,9 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if migrations[2] != expected003 {
 		t.Errorf("expected third migration %q, got %q", expected003, migrations[2])
+	}
+	if migrations[3] != expected004 {
+		t.Errorf("expected fourth migration %q, got %q", expected004, migrations[3])
 	}
 
 	// Verify migration 001 contents
@@ -121,6 +125,44 @@ func TestEmbeddedMigrations(t *testing.T) {
 	for _, keyword := range prohibitedKeywords003 {
 		if strings.Contains(normalized003, keyword) {
 			t.Errorf("migration 003 contains prohibited term %q", keyword)
+		}
+	}
+
+	// Verify migration 004 contents
+	content004, err := migrationsFS.ReadFile("migrations/" + expected004)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected004, err)
+	}
+	sql004 := string(content004)
+
+	requiredClauses004 := []string{
+		"ALTER TABLE stackpilot.agents",
+		"last_seen_at timestamptz NULL",
+		"protocol_version integer NULL",
+		"agents_protocol_version_check CHECK (protocol_version IS NULL OR protocol_version > 0)",
+		"---- create above / drop below ----",
+		"DROP CONSTRAINT agents_protocol_version_check",
+		"DROP COLUMN protocol_version",
+		"DROP COLUMN last_seen_at",
+	}
+	for _, clause := range requiredClauses004 {
+		if !strings.Contains(sql004, clause) {
+			t.Errorf("migration 004 missing required clause %q", clause)
+		}
+	}
+
+	normalized004 := strings.ToLower(sql004)
+	prohibitedKeywords004 := []string{
+		"cascade",
+		"online",
+		"offline",
+		"status",
+		"hostname",
+		"metrics",
+	}
+	for _, keyword := range prohibitedKeywords004 {
+		if strings.Contains(normalized004, keyword) {
+			t.Errorf("migration 004 contains prohibited term %q", keyword)
 		}
 	}
 }

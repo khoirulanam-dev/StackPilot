@@ -28,14 +28,18 @@ import (
 
 	"stackpilot/internal/agent"
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/protocol"
 )
 
 type fakeAuthBackend struct {
-	mu           sync.Mutex
-	agents       map[[32]byte]*enrollment.AgentRecord
-	lastQueryKey [32]byte
-	findErr      error
-	registerErr  error
+	mu                  sync.Mutex
+	agents              map[[32]byte]*enrollment.AgentRecord
+	lastQueryKey        [32]byte
+	findErr             error
+	registerErr         error
+	heartbeatErr        error
+	lastHeartbeatKey    [32]byte
+	lastProtocolVersion int
 }
 
 func (f *fakeAuthBackend) RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*enrollment.AgentRecord, bool, error) {
@@ -69,6 +73,29 @@ func (f *fakeAuthBackend) FindAgentByPublicKey(ctx context.Context, publicKey [3
 
 	if f.agents != nil {
 		if rec, ok := f.agents[publicKey]; ok {
+			return rec, nil
+		}
+	}
+	return nil, enrollment.ErrAgentNotFound
+}
+
+func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error) {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	f.lastHeartbeatKey = publicKey
+	f.lastProtocolVersion = protocolVersion
+
+	if f.heartbeatErr != nil {
+		return nil, f.heartbeatErr
+	}
+
+	if f.agents != nil {
+		if rec, ok := f.agents[publicKey]; ok {
+			now := time.Now().UTC()
+			pv := protocolVersion
+			rec.LastSeenAt = &now
+			rec.ProtocolVersion = &pv
 			return rec, nil
 		}
 	}
@@ -630,5 +657,431 @@ func TestStackPilotTLS_EndToEnd(t *testing.T) {
 	}
 	if meta.AgentID != agentID {
 		t.Errorf("identity.json agent_id mismatch: got %q, want %q", meta.AgentID, agentID)
+	}
+}
+
+func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
+	now := time.Now()
+	backend := &fakeAuthBackend{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newRemoteHandler(logger, backend, backend)
+
+	// Enroll Agent A
+	_, _, validCertA := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+	pubKeyA := validCertA.PublicKey.(ed25519.PublicKey)
+	var keyA [32]byte
+	copy(keyA[:], pubKeyA)
+
+	const agentIDA = "018f0000-0000-7000-8000-000000000001"
+	backend.agents = map[[32]byte]*enrollment.AgentRecord{
+		keyA: {
+			ID:        agentIDA,
+			PublicKey: keyA,
+			CreatedAt: now.Add(-10 * time.Minute),
+		},
+	}
+
+	validBody := `{"protocol_version": 1}`
+
+	// 1. Plaintext POST heartbeat -> TLS rejection (400)
+	t.Run("plaintext_post_heartbeat_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for plaintext heartbeat, got %d", rec.Code)
+		}
+	})
+
+	// 2. TLS GET heartbeat -> 405 Allow POST
+	t.Run("tls_get_heartbeat_method_not_allowed", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodGet, protocol.HeartbeatEndpointPath, nil)
+		req.TLS = &tls.ConnectionState{
+			PeerCertificates: []*x509.Certificate{validCertA},
+		}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusMethodNotAllowed {
+			t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
+		}
+		if allow := rec.Header().Get("Allow"); allow != "POST" {
+			t.Errorf("expected Allow: POST header, got %q", allow)
+		}
+	})
+
+	// 3. Missing client cert -> 401
+	t.Run("missing_client_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: nil}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
+
+	// 4. Wrong crypto key type (e.g. ECDSA) -> 401
+	t.Run("wrong_key_type_rejected", func(t *testing.T) {
+		_, ecdsaCert := helperGenerateECDSACert(t)
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{ecdsaCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for ECDSA cert, got %d", rec.Code)
+		}
+	})
+
+	// 5. Unknown Ed25519 key -> 401
+	t.Run("unknown_ed25519_key_rejected", func(t *testing.T) {
+		_, _, unknownCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{unknownCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unknown key, got %d", rec.Code)
+		}
+	})
+
+	// 6. Expired client cert -> 401
+	t.Run("expired_client_cert_rejected", func(t *testing.T) {
+		_, _, expiredCert := helperGenerateEd25519Cert(t, now.Add(-2*time.Hour), now.Add(-1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{expiredCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for expired cert, got %d", rec.Code)
+		}
+	})
+
+	// 7. Future client cert -> 401
+	t.Run("future_client_cert_rejected", func(t *testing.T) {
+		_, _, futureCert := helperGenerateEd25519Cert(t, now.Add(1*time.Hour), now.Add(2*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{futureCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for future cert, got %d", rec.Code)
+		}
+	})
+
+	// 8. Wrong EKU -> 401
+	t.Run("wrong_eku_rejected", func(t *testing.T) {
+		_, _, serverOnlyCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{serverOnlyCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for server auth only cert, got %d", rec.Code)
+		}
+	})
+
+	// 9. Valid cert + protocol 1 -> 204
+	t.Run("valid_cert_and_protocol_1_succeeds", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 No Content, got %d", rec.Code)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("expected Cache-Control: no-store, got %q", cc)
+		}
+		if rec.Body.Len() > 0 {
+			t.Errorf("expected empty body for 204, got %s", rec.Body.String())
+		}
+		if backend.lastHeartbeatKey != keyA {
+			t.Errorf("backend did not receive expected public key")
+		}
+		if backend.lastProtocolVersion != 1 {
+			t.Errorf("backend did not receive protocol_version 1")
+		}
+	})
+
+	// 10. Unsupported protocol version -> 409
+	t.Run("unsupported_protocol_version_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(`{"protocol_version": 2}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "unsupported agent protocol") {
+			t.Errorf("expected error message to mention unsupported protocol, got %s", rec.Body.String())
+		}
+	})
+
+	// 11. Unknown JSON field -> 400
+	t.Run("unknown_json_field_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra": "field"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for unknown field, got %d", rec.Code)
+		}
+	})
+
+	// 12. Oversized body -> 400
+	t.Run("oversized_body_rejected", func(t *testing.T) {
+		oversized := `{"protocol_version": 1, "padding": "` + strings.Repeat("x", 2000) + `"}`
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(oversized))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code < 400 || rec.Code >= 500 {
+			t.Fatalf("expected 4xx for oversized body, got %d", rec.Code)
+		}
+	})
+
+	// 13. Malformed Content-Type -> 400
+	t.Run("malformed_content_type_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "text/plain")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for text/plain, got %d", rec.Code)
+		}
+
+		req2 := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req2.Header.Set("Content-Type", "application/json; charset=iso-8859-1")
+		req2.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec2 := httptest.NewRecorder()
+		handler.ServeHTTP(rec2, req2)
+
+		if rec2.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for non-utf8 charset, got %d", rec2.Code)
+		}
+	})
+
+	// 14. Database failure -> generic 500
+	t.Run("database_failure_returns_500", func(t *testing.T) {
+		backend.heartbeatErr = errors.New("db pool broken")
+		defer func() { backend.heartbeatErr = nil }()
+
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 for db failure, got %d", rec.Code)
+		}
+		if !strings.Contains(rec.Body.String(), "internal server error") {
+			t.Errorf("expected generic error message, got %s", rec.Body.String())
+		}
+	})
+
+	// 15. Section 43: Certificate text impersonation regression
+	t.Run("certificate_text_impersonation_rejected", func(t *testing.T) {
+		backend.agents[keyA].LastSeenAt = nil
+		// Key B is generated, but certificate CommonName / SAN claims Agent A ("018f0000-0000-7000-8000-000000000001")
+		_, _, spoofCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, agentIDA, []string{agentIDA})
+
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{spoofCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for spoofed certificate text, got %d", rec.Code)
+		}
+		// Confirm Agent A heartbeat was not updated
+		if backend.agents[keyA].LastSeenAt != nil {
+			t.Fatal("Agent A heartbeat was updated by unauthorized key B!")
+		}
+	})
+
+	// 16. No CORS wildcard
+	t.Run("no_cors_wildcard", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if acao := rec.Header().Get("Access-Control-Allow-Origin"); acao == "*" {
+			t.Fatal("handler emits CORS wildcard")
+		}
+	})
+}
+
+func TestRealTLSHeartbeat_E2E(t *testing.T) {
+	// Section 44: Real TLS heartbeat E2E test using standard library only
+	// 1. Generate test CA
+	caPub, caPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(500),
+		Subject:               pkix.Name{CommonName: "StackPilot Real TLS CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create CA cert: %v", err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	// 2. Generate server TLS certificate signed by CA
+	srvPub, srvPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate srv key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(501),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, srvPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create srv cert: %v", err)
+	}
+	srvTLSCert := tls.Certificate{
+		Certificate: [][]byte{srvDER},
+		PrivateKey:  srvPriv,
+	}
+
+	// 3. Start real HTTPS server with newRemoteHandler
+	backend := &fakeAuthBackend{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	remoteHandler := newRemoteHandler(logger, backend, backend)
+
+	ts := httptest.NewUnstartedServer(remoteHandler)
+	ts.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{srvTLSCert},
+		ClientAuth:   tls.RequestClientCert,
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	// 4. Enroll Agent in local state and in backend
+	tempDir := t.TempDir()
+	stateDir := filepath.Join(tempDir, "state")
+	if err := agent.EnsureStateDir(stateDir); err != nil {
+		t.Fatalf("EnsureStateDir failed: %v", err)
+	}
+
+	pub, priv, err := agent.LoadOrGenerateKey(stateDir, rand.Reader)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey failed: %v", err)
+	}
+
+	var key32 [32]byte
+	copy(key32[:], pub)
+
+	const agentID = "018f0000-0000-7000-8000-000000000099"
+	backend.agents = map[[32]byte]*enrollment.AgentRecord{
+		key32: {
+			ID:        agentID,
+			PublicKey: key32,
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	meta := &agent.IdentityMetadata{
+		Version:       1,
+		AgentID:       agentID,
+		ControllerURL: ts.URL,
+		PublicKey:     agent.FormatPublicKeyBase64RawURL(pub),
+	}
+	if err := agent.WriteIdentityMetadata(stateDir, meta); err != nil {
+		t.Fatalf("WriteIdentityMetadata failed: %v", err)
+	}
+
+	caPath := filepath.Join(tempDir, "controller-ca.pem")
+	if err := os.WriteFile(caPath, caPEM, 0644); err != nil {
+		t.Fatalf("failed to write CA file: %v", err)
+	}
+	if err := agent.ValidateAndPersistCAFile(stateDir, caPath); err != nil {
+		t.Fatalf("ValidateAndPersistCAFile failed: %v", err)
+	}
+
+	// 5. Build ephemeral client cert from agent's private key
+	clientCert, err := agent.BuildEphemeralClientCert(priv)
+	if err != nil {
+		t.Fatalf("BuildEphemeralClientCert failed: %v", err)
+	}
+
+	rootCAs, err := agent.LoadControllerTrustRoots(stateDir)
+	if err != nil {
+		t.Fatalf("LoadControllerTrustRoots failed: %v", err)
+	}
+
+	client := agent.BuildAgentHTTPClient(rootCAs, &clientCert)
+
+	// 6. Perform real TLS POST /api/v1/agent/heartbeat
+	hbURL := ts.URL + protocol.HeartbeatEndpointPath
+	payload, _ := json.Marshal(protocol.HeartbeatRequest{ProtocolVersion: protocol.CurrentVersion})
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPost, hbURL, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("failed to construct HTTP request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("real TLS heartbeat request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content, got %d", resp.StatusCode)
+	}
+
+	// 7. Verify backend received the correct public key and updated presence
+	if backend.lastHeartbeatKey != key32 {
+		t.Errorf("backend received key mismatch: got %x, want %x", backend.lastHeartbeatKey, key32)
+	}
+	if backend.lastProtocolVersion != 1 {
+		t.Errorf("backend received protocol version %d, want 1", backend.lastProtocolVersion)
+	}
+	if backend.agents[key32].LastSeenAt == nil {
+		t.Fatal("backend record LastSeenAt was not updated")
 	}
 }
