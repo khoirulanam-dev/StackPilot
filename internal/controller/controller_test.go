@@ -2,6 +2,7 @@ package controller
 
 import (
 	"context"
+	"fmt"
 	"io"
 	"log/slog"
 	"net"
@@ -12,9 +13,17 @@ import (
 	"time"
 )
 
+type fakeReadinessChecker struct {
+	pingErr error
+}
+
+func (f *fakeReadinessChecker) Ping(ctx context.Context) error {
+	return f.pingErr
+}
+
 func TestHealthzEndpoint(t *testing.T) {
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-	handler := newHandler(logger)
+	handler := newHandler(logger, nil)
 
 	tests := []struct {
 		name       string
@@ -68,6 +77,103 @@ func TestHealthzEndpoint(t *testing.T) {
 	}
 }
 
+func TestReadyzEndpoint(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	const secret = "stackpilot-super-secret-test-value"
+
+	t.Run("database healthy", func(t *testing.T) {
+		checker := &fakeReadinessChecker{pingErr: nil}
+		handler := newHandler(logger, checker)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected status %d, got %d", http.StatusOK, rr.Code)
+		}
+		if body := rr.Body.String(); body != "OK" {
+			t.Errorf("expected body %q, got %q", "OK", body)
+		}
+	})
+
+	t.Run("database unavailable does not leak secret", func(t *testing.T) {
+		checker := &fakeReadinessChecker{
+			pingErr: fmt.Errorf("password authentication failed for %s", secret),
+		}
+		handler := newHandler(logger, checker)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, rr.Code)
+		}
+		body := rr.Body.String()
+		if body != "NOT READY" {
+			t.Errorf("expected body %q, got %q", "NOT READY", body)
+		}
+		if strings.Contains(body, secret) {
+			t.Fatalf("response body leaked secret: %s", body)
+		}
+	})
+
+	t.Run("nil checker returns 503 NOT READY", func(t *testing.T) {
+		handler := newHandler(logger, nil)
+
+		req := httptest.NewRequest(http.MethodGet, "/readyz", nil)
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusServiceUnavailable {
+			t.Errorf("expected status %d, got %d", http.StatusServiceUnavailable, rr.Code)
+		}
+		if body := rr.Body.String(); body != "NOT READY" {
+			t.Errorf("expected body %q, got %q", "NOT READY", body)
+		}
+	})
+
+	t.Run("POST /readyz returns 405 Method Not Allowed with Allow GET", func(t *testing.T) {
+		checker := &fakeReadinessChecker{pingErr: nil}
+		handler := newHandler(logger, checker)
+
+		req := httptest.NewRequest(http.MethodPost, "/readyz", nil)
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusMethodNotAllowed {
+			t.Errorf("expected status %d, got %d", http.StatusMethodNotAllowed, rr.Code)
+		}
+		if allow := rr.Header().Get("Allow"); allow != "GET" {
+			t.Errorf("expected Allow header 'GET', got %q", allow)
+		}
+	})
+
+	t.Run("healthz remains 200 OK even if readiness fails", func(t *testing.T) {
+		checker := &fakeReadinessChecker{
+			pingErr: fmt.Errorf("database connection lost: %s", secret),
+		}
+		handler := newHandler(logger, checker)
+
+		req := httptest.NewRequest(http.MethodGet, "/healthz", nil)
+		rr := httptest.NewRecorder()
+
+		handler.ServeHTTP(rr, req)
+
+		if rr.Code != http.StatusOK {
+			t.Errorf("expected /healthz status %d, got %d", http.StatusOK, rr.Code)
+		}
+		if body := rr.Body.String(); body != "OK" {
+			t.Errorf("expected body %q, got %q", "OK", body)
+		}
+	})
+}
+
 func TestServe_GracefulShutdown(t *testing.T) {
 	l, err := net.Listen("tcp", "127.0.0.1:0")
 	if err != nil {
@@ -78,9 +184,11 @@ func TestServe_GracefulShutdown(t *testing.T) {
 	ctx, cancel := context.WithCancel(context.Background())
 	defer cancel()
 
+	checker := &fakeReadinessChecker{pingErr: nil}
+
 	errCh := make(chan error, 1)
 	go func() {
-		errCh <- serve(ctx, l, logger)
+		errCh <- serve(ctx, l, checker, logger)
 	}()
 
 	client := &http.Client{
@@ -102,6 +210,16 @@ func TestServe_GracefulShutdown(t *testing.T) {
 	}
 	if string(body) != "OK" {
 		t.Errorf("expected body %q, got %q", "OK", string(body))
+	}
+
+	readyResp, err := client.Get("http://" + l.Addr().String() + "/readyz")
+	if err != nil {
+		t.Fatalf("failed to execute GET /readyz: %v", err)
+	}
+	defer readyResp.Body.Close()
+
+	if readyResp.StatusCode != http.StatusOK {
+		t.Errorf("expected status 200 OK on /readyz, got %d", readyResp.StatusCode)
 	}
 
 	cancel()
@@ -126,13 +244,14 @@ func TestRun_ListenFailure(t *testing.T) {
 	cfg := Config{
 		ListenAddress: l.Addr().String(),
 		LogLevel:      slog.LevelInfo,
+		DatabaseURL:   "postgres://stackpilot:secret@127.0.0.1:5432/stackpilot",
 	}
 	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
 
 	ctx, cancel := context.WithTimeout(context.Background(), 2*time.Second)
 	defer cancel()
 
-	err = Run(ctx, cfg, logger)
+	err = Run(ctx, cfg, nil, logger)
 	if err == nil {
 		t.Fatal("expected Run() to fail on occupied address, got nil")
 	}
@@ -150,8 +269,9 @@ func TestRun_DirectConfigValidation(t *testing.T) {
 		cfg := Config{
 			ListenAddress: "0.0.0.0:7447",
 			LogLevel:      slog.LevelInfo,
+			DatabaseURL:   "postgres://stackpilot:secret@127.0.0.1:5432/stackpilot",
 		}
-		err := Run(ctx, cfg, logger)
+		err := Run(ctx, cfg, nil, logger)
 		if err == nil {
 			t.Fatal("expected Run() to reject 0.0.0.0, got nil")
 		}
@@ -164,13 +284,44 @@ func TestRun_DirectConfigValidation(t *testing.T) {
 		cfg := Config{
 			ListenAddress: "127.0.0.1:7447",
 			LogLevel:      slog.Level(100),
+			DatabaseURL:   "postgres://stackpilot:secret@127.0.0.1:5432/stackpilot",
 		}
-		err := Run(ctx, cfg, logger)
+		err := Run(ctx, cfg, nil, logger)
 		if err == nil {
 			t.Fatal("expected Run() to reject invalid slog.Level(100), got nil")
 		}
 		if !strings.Contains(err.Error(), "unsupported") {
 			t.Errorf("error %q does not mention unsupported", err.Error())
+		}
+	})
+
+	t.Run("rejects empty database URL directly constructed", func(t *testing.T) {
+		cfg := Config{
+			ListenAddress: "127.0.0.1:7447",
+			LogLevel:      slog.LevelInfo,
+			DatabaseURL:   "",
+		}
+		err := Run(ctx, cfg, nil, logger)
+		if err == nil {
+			t.Fatal("expected Run() to reject empty DatabaseURL, got nil")
+		}
+		if !strings.Contains(err.Error(), "cannot be empty") {
+			t.Errorf("error %q does not mention cannot be empty", err.Error())
+		}
+	})
+
+	t.Run("rejects invalid database URL directly constructed", func(t *testing.T) {
+		cfg := Config{
+			ListenAddress: "127.0.0.1:7447",
+			LogLevel:      slog.LevelInfo,
+			DatabaseURL:   "invalid-url",
+		}
+		err := Run(ctx, cfg, nil, logger)
+		if err == nil {
+			t.Fatal("expected Run() to reject invalid DatabaseURL, got nil")
+		}
+		if !strings.Contains(err.Error(), "scheme must be postgres or postgresql") {
+			t.Errorf("error %q does not mention scheme requirement", err.Error())
 		}
 	})
 }

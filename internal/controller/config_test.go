@@ -7,6 +7,8 @@ import (
 	"testing"
 )
 
+const testDefaultDatabaseURL = "postgres://stackpilot:secret@127.0.0.1:5432/stackpilot?sslmode=disable"
+
 func unsetEnv(t *testing.T, key string) {
 	t.Helper()
 	if val, ok := os.LookupEnv(key); ok {
@@ -30,6 +32,7 @@ func unsetEnv(t *testing.T, key string) {
 func TestLoadConfig_Defaults(t *testing.T) {
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
 	cfg, err := LoadConfig()
 	if err != nil {
@@ -45,10 +48,15 @@ func TestLoadConfig_Defaults(t *testing.T) {
 	if cfg.LogLevel != wantLevel {
 		t.Errorf("LogLevel = %v, want %v", cfg.LogLevel, wantLevel)
 	}
+
+	if cfg.DatabaseURL != testDefaultDatabaseURL {
+		t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, testDefaultDatabaseURL)
+	}
 }
 
 func TestLoadConfig_ListenAddressValid(t *testing.T) {
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
 	tests := []struct {
 		name     string
@@ -94,6 +102,7 @@ func TestLoadConfig_ListenAddressValid(t *testing.T) {
 
 func TestLoadConfig_ListenAddressInvalid(t *testing.T) {
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
 	tests := []struct {
 		name    string
@@ -189,6 +198,7 @@ func TestLoadConfig_ListenAddressInvalid(t *testing.T) {
 
 func TestLoadConfig_LogLevelValid(t *testing.T) {
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
 	tests := []struct {
 		name      string
@@ -222,6 +232,7 @@ func TestLoadConfig_LogLevelValid(t *testing.T) {
 
 func TestLoadConfig_LogLevelInvalid(t *testing.T) {
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
 	tests := []struct {
 		name    string
@@ -247,5 +258,171 @@ func TestLoadConfig_LogLevelInvalid(t *testing.T) {
 				t.Errorf("error %q does not contain expected substring %q", err.Error(), tt.wantErr)
 			}
 		})
+	}
+}
+
+func TestLoadConfig_DatabaseURLMissing(t *testing.T) {
+	unsetEnv(t, "STACKPILOT_DATABASE_URL")
+
+	_, err := LoadConfig()
+	if err == nil {
+		t.Fatal("LoadConfig() expected error when STACKPILOT_DATABASE_URL is absent, got nil")
+	}
+	if !strings.Contains(err.Error(), "missing required STACKPILOT_DATABASE_URL") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestLoadConfig_DatabaseURLEmpty(t *testing.T) {
+	t.Setenv("STACKPILOT_DATABASE_URL", "")
+
+	_, err := LoadConfig()
+	if err == nil {
+		t.Fatal("LoadConfig() expected error when STACKPILOT_DATABASE_URL is empty, got nil")
+	}
+	if !strings.Contains(err.Error(), "cannot be empty") {
+		t.Errorf("unexpected error message: %v", err)
+	}
+}
+
+func TestLoadConfig_DatabaseURLValid(t *testing.T) {
+	tests := []struct {
+		name     string
+		input    string
+		wantHost string
+	}{
+		{
+			name:  "standard postgres loopback",
+			input: "postgres://stackpilot:password@127.0.0.1:5432/stackpilot?sslmode=disable",
+		},
+		{
+			name:  "standard postgresql remote host",
+			input: "postgresql://stackpilot:password@db.internal:5432/stackpilot?sslmode=verify-full",
+		},
+		{
+			name:  "no password specified",
+			input: "postgres://stackpilot@127.0.0.1:5432/stackpilot",
+		},
+		{
+			name:  "hostname without port",
+			input: "postgres://stackpilot:password@db.internal/stackpilot",
+		},
+		{
+			name:  "IPv6 host literal",
+			input: "postgresql://user:pass@[::1]:5432/stackpilot",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("STACKPILOT_DATABASE_URL", tt.input)
+
+			cfg, err := LoadConfig()
+			if err != nil {
+				t.Fatalf("LoadConfig() returned unexpected error: %v", err)
+			}
+			if cfg.DatabaseURL != tt.input {
+				t.Errorf("DatabaseURL = %q, want %q", cfg.DatabaseURL, tt.input)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_DatabaseURLInvalid(t *testing.T) {
+	tests := []struct {
+		name    string
+		input   string
+		wantErr string
+	}{
+		{
+			name:    "unsupported scheme http",
+			input:   "http://localhost:5432/stackpilot",
+			wantErr: "scheme must be postgres or postgresql",
+		},
+		{
+			name:    "unsupported scheme mysql",
+			input:   "mysql://user:pass@localhost:5432/stackpilot",
+			wantErr: "scheme must be postgres or postgresql",
+		},
+		{
+			name:    "missing scheme",
+			input:   "localhost:5432/stackpilot",
+			wantErr: "scheme must be postgres or postgresql",
+		},
+		{
+			name:    "missing host",
+			input:   "postgres:///stackpilot",
+			wantErr: "host cannot be empty",
+		},
+		{
+			name:    "missing host with user",
+			input:   "postgres://user:pass@/stackpilot",
+			wantErr: "host cannot be empty",
+		},
+		{
+			name:    "missing database name with trailing slash",
+			input:   "postgres://user:pass@localhost:5432/",
+			wantErr: "database name cannot be empty",
+		},
+		{
+			name:    "missing database name without trailing slash",
+			input:   "postgres://user:pass@localhost:5432",
+			wantErr: "database name cannot be empty",
+		},
+		{
+			name:    "malformed url with control chars",
+			input:   "postgres://localhost:5432/\x7f",
+			wantErr: "invalid PostgreSQL connection URL",
+		},
+	}
+
+	for _, tt := range tests {
+		t.Run(tt.name, func(t *testing.T) {
+			t.Setenv("STACKPILOT_DATABASE_URL", tt.input)
+
+			_, err := LoadConfig()
+			if err == nil {
+				t.Fatalf("LoadConfig() with input %q expected error, got nil", tt.input)
+			}
+			if !strings.Contains(err.Error(), tt.wantErr) {
+				t.Errorf("error %q does not contain expected substring %q", err.Error(), tt.wantErr)
+			}
+		})
+	}
+}
+
+func TestLoadConfig_DatabaseURLSecretRedaction(t *testing.T) {
+	const secret = "stackpilot-super-secret-test-value"
+
+	invalidURLs := []string{
+		"postgres://admin:" + secret + "@/invalid",
+		"http://admin:" + secret + "@localhost:5432/stackpilot",
+		"postgres://admin:" + secret + "@localhost:5432/",
+		"postgres://admin:" + secret + "@localhost:5432/\x7f",
+	}
+
+	for _, rawURL := range invalidURLs {
+		t.Setenv("STACKPILOT_DATABASE_URL", rawURL)
+
+		_, err := LoadConfig()
+		if err == nil {
+			t.Fatalf("expected error for invalid URL %q, got nil", rawURL)
+		}
+		if strings.Contains(err.Error(), secret) {
+			t.Fatalf("error message leaked secret: %s", err.Error())
+		}
+	}
+
+	// Verify LogValue redaction on Config
+	validURL := "postgres://admin:" + secret + "@127.0.0.1:5432/stackpilot"
+	t.Setenv("STACKPILOT_DATABASE_URL", validURL)
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error loading config: %v", err)
+	}
+
+	logVal := cfg.LogValue()
+	if strings.Contains(logVal.String(), secret) {
+		t.Fatalf("LogValue leaked secret: %s", logVal.String())
 	}
 }

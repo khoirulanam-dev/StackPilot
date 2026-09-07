@@ -29,3 +29,19 @@ c.out
 .env
 .env.*
 !.env.example
+
+# Database dump, backup, and credential artifacts
+*.dump
+*.backup
+*.pgdump
+*.sql.gz
+*.sql.bz2
+*.sql.xz
+*.sql.bak
+dump.sql
+backup.sql
+database.sql
+db.sql
+.pgpass
+pgpass.conf
+
