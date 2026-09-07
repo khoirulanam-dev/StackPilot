@@ -8,6 +8,8 @@ import (
 	"time"
 
 	"github.com/jackc/pgx/v5/pgxpool"
+
+	"stackpilot/internal/enrollment"
 )
 
 const (
@@ -78,6 +80,31 @@ func (db *DB) Close() {
 	if db.pool != nil {
 		db.pool.Close()
 	}
+}
+
+// CreateEnrollmentToken inserts a token hash and its expiration into stackpilot.enrollment_tokens.
+func (db *DB) CreateEnrollmentToken(ctx context.Context, tokenHash [32]byte, expiresAt time.Time) (*enrollment.TokenRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	const query = `
+		INSERT INTO stackpilot.enrollment_tokens (token_hash, expires_at)
+		VALUES ($1, $2)
+		RETURNING id::text, created_at, expires_at
+	`
+
+	record := &enrollment.TokenRecord{}
+	err := db.pool.QueryRow(ctx, query, tokenHash[:], expiresAt).Scan(
+		&record.ID,
+		&record.CreatedAt,
+		&record.ExpiresAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to create enrollment token: %w", sanitizeError(err))
+	}
+
+	return record, nil
 }
 
 var (
