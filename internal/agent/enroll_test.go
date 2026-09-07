@@ -3,7 +3,9 @@ package agent
 import (
 	"context"
 	"crypto/ed25519"
+	"crypto/rand"
 	"encoding/json"
+	"errors"
 	"io"
 	"net/http"
 	"net/http/httptest"
@@ -21,21 +23,32 @@ func TestValidateControllerURL(t *testing.T) {
 		url     string
 		wantErr bool
 	}{
-		{"valid loopback ipv4", "http://127.0.0.1:7447", false},
-		{"valid loopback ipv6", "http://[::1]:7447", false},
+		{"valid loopback ipv4 http", "http://127.0.0.1:7447", false},
+		{"valid loopback ipv6 http", "http://[::1]:7447", false},
+		{"valid loopback ipv4 https", "https://127.0.0.1:7448", false},
+		{"valid loopback ipv6 https", "https://[::1]:7448", false},
+		{"valid dns hostname https", "https://stackpilot.example.com:7448", false},
+		{"valid lan ipv4 https", "https://10.0.0.10:7448", false},
+		{"valid ipv6 https", "https://[2001:db8::10]:7448", false},
 		{"missing scheme", "127.0.0.1:7447", true},
-		{"https scheme", "https://127.0.0.1:7447", true},
+		{"unsupported ftp scheme", "ftp://127.0.0.1:7447", true},
 		{"credentials present", "http://user:pass@127.0.0.1:7447", true},
+		{"https credentials present", "https://user:pass@stackpilot.example.com:7448", true},
 		{"query present", "http://127.0.0.1:7447?foo=bar", true},
+		{"https query present", "https://stackpilot.example.com:7448?foo=bar", true},
 		{"fragment present", "http://127.0.0.1:7447#frag", true},
-		{"localhost rejected", "http://localhost:7447", true},
-		{"dns hostname rejected", "http://controller.local:7447", true},
-		{"lan ip rejected", "http://192.168.1.50:7447", true},
-		{"public ip rejected", "http://8.8.8.8:7447", true},
-		{"wildcard ip rejected", "http://0.0.0.0:7447", true},
-		{"missing port", "http://127.0.0.1", true},
-		{"zero port", "http://127.0.0.1:0", true},
-		{"invalid port", "http://127.0.0.1:99999", true},
+		{"https fragment present", "https://stackpilot.example.com:7448#frag", true},
+		{"https non-root path present", "https://stackpilot.example.com:7448/api/v1", true},
+		{"localhost http rejected", "http://localhost:7447", true},
+		{"dns hostname http rejected", "http://controller.local:7447", true},
+		{"lan ip http rejected", "http://10.0.0.10:7448", true},
+		{"public ip http rejected", "http://203.0.113.10:7448", true},
+		{"wildcard ip http rejected", "http://0.0.0.0:7448", true},
+		{"wildcard ip https rejected", "https://0.0.0.0:7448", true},
+		{"wildcard ipv6 https rejected", "https://[::]:7448", true},
+		{"missing port", "https://stackpilot.example.com", true},
+		{"zero port", "https://stackpilot.example.com:0", true},
+		{"invalid port", "https://stackpilot.example.com:99999", true},
 	}
 
 	for _, tc := range cases {
@@ -615,5 +628,82 @@ func TestEnroll_ResponseValidation(t *testing.T) {
 				t.Fatalf("identity.json must not be created on failed response validation in case %s", tc.name)
 			}
 		})
+	}
+}
+
+type readTracker struct {
+	readCalled bool
+}
+
+func (r *readTracker) Read(p []byte) (n int, err error) {
+	r.readCalled = true
+	return 0, io.EOF
+}
+
+func TestEnroll_ExistingIdentityRejectsBeforeCAOrTokenOrNetwork(t *testing.T) {
+	tempDir := t.TempDir()
+	stateDir := filepath.Join(tempDir, "state")
+	if err := EnsureStateDir(stateDir); err != nil {
+		t.Fatalf("EnsureStateDir failed: %v", err)
+	}
+
+	// 1. Create a valid enrolled identity
+	pub, _, err := LoadOrGenerateKey(stateDir, rand.Reader)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey failed: %v", err)
+	}
+	meta := &IdentityMetadata{
+		Version:       1,
+		AgentID:       "018f0000-0000-7000-8000-000000000001",
+		ControllerURL: "https://127.0.0.1:7448",
+		PublicKey:     FormatPublicKeyBase64RawURL(pub),
+	}
+	if err := WriteIdentityMetadata(stateDir, meta); err != nil {
+		t.Fatalf("WriteIdentityMetadata failed: %v", err)
+	}
+
+	// 2. Prepare a new CA file
+	caFile := filepath.Join(tempDir, "new-ca.pem")
+	if err := os.WriteFile(caFile, []byte("some-dummy-ca-pem"), 0644); err != nil {
+		t.Fatalf("failed to write CA file: %v", err)
+	}
+
+	// Track if token reader is read
+	tracker := &readTracker{}
+
+	// Server that must NOT be called
+	var networkCalled bool
+	server := httptest.NewTLSServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		networkCalled = true
+		w.WriteHeader(http.StatusCreated)
+	}))
+	defer server.Close()
+
+	opts := EnrollOptions{
+		ControllerURL: server.URL,
+		StateDir:      stateDir,
+		CAFile:        caFile,
+		TokenReader:   tracker,
+	}
+
+	_, err = Enroll(context.Background(), opts)
+	if !errors.Is(err, ErrAlreadyEnrolled) {
+		t.Fatalf("expected ErrAlreadyEnrolled, got: %v", err)
+	}
+
+	// Verify controller-ca.pem is NOT created
+	caPath := filepath.Join(stateDir, ControllerCAPEMFileName)
+	if _, err := os.Stat(caPath); !errors.Is(err, os.ErrNotExist) {
+		t.Errorf("controller-ca.pem should not have been created or modified, err=%v", err)
+	}
+
+	// Verify token was NOT read
+	if tracker.readCalled {
+		t.Errorf("token reader should not have been read")
+	}
+
+	// Verify no network request was made
+	if networkCalled {
+		t.Errorf("no network request should have been made")
 	}
 }

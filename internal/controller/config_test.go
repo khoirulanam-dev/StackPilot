@@ -29,7 +29,15 @@ func unsetEnv(t *testing.T, key string) {
 	}
 }
 
+func isolateRemoteAgentEnv(t *testing.T) {
+	t.Helper()
+	unsetEnv(t, "STACKPILOT_AGENT_LISTEN_ADDRESS")
+	unsetEnv(t, "STACKPILOT_AGENT_TLS_CERT_FILE")
+	unsetEnv(t, "STACKPILOT_AGENT_TLS_KEY_FILE")
+}
+
 func TestLoadConfig_Defaults(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
 	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
@@ -55,6 +63,7 @@ func TestLoadConfig_Defaults(t *testing.T) {
 }
 
 func TestLoadConfig_ListenAddressValid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
 	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
@@ -101,6 +110,7 @@ func TestLoadConfig_ListenAddressValid(t *testing.T) {
 }
 
 func TestLoadConfig_ListenAddressInvalid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_LOG_LEVEL")
 	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
@@ -197,6 +207,7 @@ func TestLoadConfig_ListenAddressInvalid(t *testing.T) {
 }
 
 func TestLoadConfig_LogLevelValid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
 	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
@@ -231,6 +242,7 @@ func TestLoadConfig_LogLevelValid(t *testing.T) {
 }
 
 func TestLoadConfig_LogLevelInvalid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_LISTEN_ADDRESS")
 	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
 
@@ -262,6 +274,7 @@ func TestLoadConfig_LogLevelInvalid(t *testing.T) {
 }
 
 func TestLoadConfig_DatabaseURLMissing(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	unsetEnv(t, "STACKPILOT_DATABASE_URL")
 
 	_, err := LoadConfig()
@@ -274,6 +287,7 @@ func TestLoadConfig_DatabaseURLMissing(t *testing.T) {
 }
 
 func TestLoadConfig_DatabaseURLEmpty(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	t.Setenv("STACKPILOT_DATABASE_URL", "")
 
 	_, err := LoadConfig()
@@ -286,6 +300,7 @@ func TestLoadConfig_DatabaseURLEmpty(t *testing.T) {
 }
 
 func TestLoadConfig_DatabaseURLValid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	tests := []struct {
 		name     string
 		input    string
@@ -329,6 +344,7 @@ func TestLoadConfig_DatabaseURLValid(t *testing.T) {
 }
 
 func TestLoadConfig_DatabaseURLInvalid(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	tests := []struct {
 		name    string
 		input   string
@@ -392,6 +408,7 @@ func TestLoadConfig_DatabaseURLInvalid(t *testing.T) {
 }
 
 func TestLoadConfig_DatabaseURLSecretRedaction(t *testing.T) {
+	isolateRemoteAgentEnv(t)
 	const secret = "stackpilot-super-secret-test-value"
 
 	invalidURLs := []string{
@@ -424,5 +441,102 @@ func TestLoadConfig_DatabaseURLSecretRedaction(t *testing.T) {
 	logVal := cfg.LogValue()
 	if strings.Contains(logVal.String(), secret) {
 		t.Fatalf("LogValue leaked secret: %s", logVal.String())
+	}
+}
+
+func TestLoadConfig_AgentRemoteListener(t *testing.T) {
+	isolateRemoteAgentEnv(t)
+	t.Setenv("STACKPILOT_DATABASE_URL", testDefaultDatabaseURL)
+
+	// 1. Omitted: remote disabled
+	cfg, err := LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error: %v", err)
+	}
+	if cfg.RemoteEnabled() {
+		t.Errorf("expected RemoteEnabled() to be false when agent listen address is omitted")
+	}
+
+	// 2. Configured without cert: validation failure
+	t.Setenv("STACKPILOT_AGENT_LISTEN_ADDRESS", "0.0.0.0:7448")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Fatal("expected error when agent listen address is configured without cert/key")
+	}
+
+	// 3. Configured with cert but without key: validation failure
+	t.Setenv("STACKPILOT_AGENT_TLS_CERT_FILE", "/path/to/cert.pem")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Fatal("expected error when agent listen address is configured without key")
+	}
+
+	// 4. Configured with cert and key: valid
+	t.Setenv("STACKPILOT_AGENT_TLS_KEY_FILE", "/path/to/key.pem")
+	cfg, err = LoadConfig()
+	if err != nil {
+		t.Fatalf("unexpected error with cert and key configured: %v", err)
+	}
+	if !cfg.RemoteEnabled() {
+		t.Errorf("expected RemoteEnabled() to be true")
+	}
+	if cfg.AgentListenAddress != "0.0.0.0:7448" {
+		t.Errorf("expected agent listen address 0.0.0.0:7448, got %q", cfg.AgentListenAddress)
+	}
+
+	// 5. Check LogValue
+	logStr := cfg.LogValue().String()
+	if !strings.Contains(logStr, "agent_listen_address=0.0.0.0:7448") {
+		t.Errorf("LogValue missing agent_listen_address: %s", logStr)
+	}
+	if !strings.Contains(logStr, "agent_tls_enabled=true") {
+		t.Errorf("LogValue missing agent_tls_enabled=true: %s", logStr)
+	}
+	if strings.Contains(logStr, "/path/to/key.pem") {
+		t.Errorf("LogValue should not leak TLS key file path: %s", logStr)
+	}
+
+	// 6. Valid remote addresses: 0.0.0.0, LAN IP, loopback, IPv6 wildcard
+	validAddrs := []string{
+		"0.0.0.0:7448",
+		"10.0.0.10:7448",
+		"192.168.1.50:8443",
+		"127.0.0.1:7448",
+		"[::]:7448",
+		"[::1]:7448",
+	}
+	for _, addr := range validAddrs {
+		t.Setenv("STACKPILOT_AGENT_LISTEN_ADDRESS", addr)
+		cfg, err := LoadConfig()
+		if err != nil {
+			t.Errorf("valid agent address %q failed: %v", addr, err)
+		}
+		if cfg.AgentListenAddress != addr {
+			t.Errorf("expected %q, got %q", addr, cfg.AgentListenAddress)
+		}
+	}
+
+	// 7. Invalid remote addresses: DNS hostname, invalid port, missing port
+	invalidAddrs := []string{
+		"example.com:7448",
+		"0.0.0.0:0",
+		"0.0.0.0:70000",
+		"0.0.0.0",
+		":7448",
+	}
+	for _, addr := range invalidAddrs {
+		t.Setenv("STACKPILOT_AGENT_LISTEN_ADDRESS", addr)
+		_, err := LoadConfig()
+		if err == nil {
+			t.Errorf("expected error for invalid agent address %q, got nil", addr)
+		}
+	}
+
+	// 8. Regression: Local listen address STILL rejects 0.0.0.0:7447
+	t.Setenv("STACKPILOT_LISTEN_ADDRESS", "0.0.0.0:7447")
+	unsetEnv(t, "STACKPILOT_AGENT_LISTEN_ADDRESS")
+	_, err = LoadConfig()
+	if err == nil {
+		t.Fatal("expected local listener to reject 0.0.0.0:7447, got nil")
 	}
 }

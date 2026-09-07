@@ -2,6 +2,9 @@ package controller
 
 import (
 	"context"
+	"crypto/ed25519"
+	"crypto/tls"
+	"crypto/x509"
 	"encoding/base64"
 	"encoding/json"
 	"errors"
@@ -25,11 +28,118 @@ type enrollmentRegistrar interface {
 	RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*enrollment.AgentRecord, bool, error)
 }
 
+type agentAuthenticator interface {
+	FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*enrollment.AgentRecord, error)
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
+}
+
+func handleEnroll(w http.ResponseWriter, r *http.Request, registrar enrollmentRegistrar, logger *slog.Logger) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	// Verify Content-Type using standard library mime.ParseMediaType
+	ct := r.Header.Get("Content-Type")
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+		return
+	}
+	if charset, ok := params["charset"]; ok && strings.ToLower(charset) != "utf-8" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+		return
+	}
+
+	// Bound request size to 4 KiB
+	r.Body = http.MaxBytesReader(w, r.Body, 4096)
+
+	// Decode JSON with DisallowUnknownFields
+	decoder := json.NewDecoder(r.Body)
+	decoder.DisallowUnknownFields()
+
+	var req struct {
+		Token     string `json:"token"`
+		PublicKey string `json:"public_key"`
+	}
+
+	if err := decoder.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	// Reject trailing JSON or multiple documents
+	if decoder.More() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+	var extra any
+	if err := decoder.Decode(&extra); err != io.EOF {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+
+	// Validate token format
+	if err := enrollment.ValidateToken(req.Token); err != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "enrollment rejected"})
+		return
+	}
+
+	// Validate public key format (RawURLEncoding, no padding, exactly 32 bytes)
+	if strings.Contains(req.PublicKey, "=") {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid public key format"})
+		return
+	}
+
+	pubKeyBytes, err := base64.RawURLEncoding.DecodeString(req.PublicKey)
+	if err != nil || len(pubKeyBytes) != 32 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid public key format"})
+		return
+	}
+
+	if registrar == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
+		return
+	}
+
+	tokenHash := enrollment.HashToken(req.Token)
+	var pubKey [32]byte
+	copy(pubKey[:], pubKeyBytes)
+
+	dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	record, created, err := registrar.RegisterAgent(dbCtx, tokenHash, pubKey)
+	if err != nil {
+		if errors.Is(err, enrollment.ErrEnrollmentRejected) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "enrollment rejected"})
+			return
+		}
+		if errors.Is(err, enrollment.ErrIdentityConflict) {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "identity conflict"})
+			return
+		}
+
+		logger.Error("agent enrollment persistence failure")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	status := http.StatusOK
+	if created {
+		status = http.StatusCreated
+	}
+
+	writeJSON(w, status, map[string]string{
+		"agent_id": record.ID,
+	})
 }
 
 func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollmentRegistrar) http.Handler {
@@ -83,104 +193,91 @@ func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollm
 	})
 
 	mux.HandleFunc("/api/v1/agent/enroll", func(w http.ResponseWriter, r *http.Request) {
-		if r.Method != http.MethodPost {
-			w.Header().Set("Allow", "POST")
+		handleEnroll(w, r, registrar, logger)
+	})
+
+	return mux
+}
+
+func newRemoteHandler(logger *slog.Logger, registrar enrollmentRegistrar, authenticator agentAuthenticator) http.Handler {
+	mux := http.NewServeMux()
+
+	mux.HandleFunc("/api/v1/agent/enroll", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tls required"})
+			return
+		}
+		handleEnroll(w, r, registrar, logger)
+	})
+
+	mux.HandleFunc("/api/v1/agent/self", func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tls required"})
+			return
+		}
+
+		if r.Method != http.MethodGet {
+			w.Header().Set("Allow", "GET")
 			w.WriteHeader(http.StatusMethodNotAllowed)
 			return
 		}
 
-		// Verify Content-Type using standard library mime.ParseMediaType
-		ct := r.Header.Get("Content-Type")
-		mediaType, params, err := mime.ParseMediaType(ct)
-		if err != nil || mediaType != "application/json" {
-			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
-			return
-		}
-		if charset, ok := params["charset"]; ok && strings.ToLower(charset) != "utf-8" {
-			writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+		if len(r.TLS.PeerCertificates) == 0 {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
 			return
 		}
 
-		// Bound request size to 4 KiB
-		r.Body = http.MaxBytesReader(w, r.Body, 4096)
+		cert := r.TLS.PeerCertificates[0]
 
-		// Decode JSON with DisallowUnknownFields
-		decoder := json.NewDecoder(r.Body)
-		decoder.DisallowUnknownFields()
-
-		var req struct {
-			Token     string `json:"token"`
-			PublicKey string `json:"public_key"`
-		}
-
-		if err := decoder.Decode(&req); err != nil {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		now := time.Now()
+		if now.Before(cert.NotBefore) || now.After(cert.NotAfter) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
 			return
 		}
 
-		// Reject trailing JSON or multiple documents
-		if decoder.More() {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
-			return
+		if len(cert.ExtKeyUsage) > 0 {
+			hasClientAuth := false
+			for _, eku := range cert.ExtKeyUsage {
+				if eku == x509.ExtKeyUsageClientAuth {
+					hasClientAuth = true
+					break
+				}
+			}
+			if !hasClientAuth {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
+				return
+			}
 		}
-		var extra any
-		if err := decoder.Decode(&extra); err != io.EOF {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+
+		edPubKey, ok := cert.PublicKey.(ed25519.PublicKey)
+		if !ok || len(edPubKey) != ed25519.PublicKeySize {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
 			return
 		}
 
-		// Validate token format
-		if err := enrollment.ValidateToken(req.Token); err != nil {
-			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "enrollment rejected"})
-			return
-		}
+		var pubKey [32]byte
+		copy(pubKey[:], edPubKey)
 
-		// Validate public key format (RawURLEncoding, no padding, exactly 32 bytes)
-		if strings.Contains(req.PublicKey, "=") {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid public key format"})
-			return
-		}
-
-		pubKeyBytes, err := base64.RawURLEncoding.DecodeString(req.PublicKey)
-		if err != nil || len(pubKeyBytes) != 32 {
-			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid public key format"})
-			return
-		}
-
-		if registrar == nil {
+		if authenticator == nil {
 			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
 			return
 		}
 
-		tokenHash := enrollment.HashToken(req.Token)
-		var pubKey [32]byte
-		copy(pubKey[:], pubKeyBytes)
-
 		dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
 		defer cancel()
 
-		record, created, err := registrar.RegisterAgent(dbCtx, tokenHash, pubKey)
+		record, err := authenticator.FindAgentByPublicKey(dbCtx, pubKey)
 		if err != nil {
-			if errors.Is(err, enrollment.ErrEnrollmentRejected) {
-				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "enrollment rejected"})
+			if errors.Is(err, enrollment.ErrAgentNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
 				return
 			}
-			if errors.Is(err, enrollment.ErrIdentityConflict) {
-				writeJSON(w, http.StatusConflict, map[string]string{"error": "identity conflict"})
-				return
-			}
-
-			logger.Error("agent enrollment persistence failure")
+			logger.Error("agent authentication lookup failure")
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			return
 		}
 
-		status := http.StatusOK
-		if created {
-			status = http.StatusCreated
-		}
-
-		writeJSON(w, status, map[string]string{
+		writeJSON(w, http.StatusOK, map[string]string{
 			"agent_id": record.ID,
 		})
 	})
@@ -220,9 +317,71 @@ func serve(ctx context.Context, l net.Listener, checker readinessChecker, regist
 	}
 }
 
+func serveDual(ctx context.Context, localListener, remoteListener net.Listener, checker readinessChecker, registrar enrollmentRegistrar, authenticator agentAuthenticator, logger *slog.Logger) error {
+	localSrv := &http.Server{
+		Handler:           newHandler(logger, checker, registrar),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	remoteSrv := &http.Server{
+		Handler:           newRemoteHandler(logger, registrar, authenticator),
+		ReadHeaderTimeout: 5 * time.Second,
+		ReadTimeout:       10 * time.Second,
+		WriteTimeout:      10 * time.Second,
+		IdleTimeout:       120 * time.Second,
+	}
+
+	errCh := make(chan error, 2)
+	go func() {
+		errCh <- localSrv.Serve(localListener)
+	}()
+	go func() {
+		errCh <- remoteSrv.Serve(remoteListener)
+	}()
+
+	select {
+	case err := <-errCh:
+		// One server stopped unexpectedly; shut down the other server
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		_ = localSrv.Shutdown(shutdownCtx)
+		_ = remoteSrv.Shutdown(shutdownCtx)
+		err2 := <-errCh
+		if err != nil && !errors.Is(err, http.ErrServerClosed) {
+			return err
+		}
+		if err2 != nil && !errors.Is(err2, http.ErrServerClosed) {
+			return err2
+		}
+		return nil
+
+	case <-ctx.Done():
+		shutdownCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		err1 := localSrv.Shutdown(shutdownCtx)
+		err2 := remoteSrv.Shutdown(shutdownCtx)
+		sErr1 := <-errCh
+		sErr2 := <-errCh
+		if sErr1 != nil && !errors.Is(sErr1, http.ErrServerClosed) {
+			return sErr1
+		}
+		if sErr2 != nil && !errors.Is(sErr2, http.ErrServerClosed) {
+			return sErr2
+		}
+		if err1 != nil {
+			return err1
+		}
+		return err2
+	}
+}
+
 type runtimeBackend interface {
 	readinessChecker
 	enrollmentRegistrar
+	agentAuthenticator
 }
 
 // Run starts the controller components and blocks until ctx is canceled.
@@ -231,17 +390,52 @@ func Run(ctx context.Context, cfg Config, backend runtimeBackend, logger *slog.L
 		return fmt.Errorf("invalid controller configuration: %w", err)
 	}
 
-	var checker readinessChecker
-	var registrar enrollmentRegistrar
+	var (
+		checker       readinessChecker
+		registrar     enrollmentRegistrar
+		authenticator agentAuthenticator
+	)
 	if backend != nil {
 		checker = backend
 		registrar = backend
+		authenticator = backend
 	}
 
-	l, err := net.Listen("tcp", cfg.ListenAddress)
+	var remoteTLSConfig *tls.Config
+	if cfg.RemoteEnabled() {
+		var err error
+		remoteTLSConfig, err = buildRemoteTLSConfig(cfg.AgentTLSCertFile, cfg.AgentTLSKeyFile)
+		if err != nil {
+			return err
+		}
+	}
+
+	localListener, err := net.Listen("tcp", cfg.ListenAddress)
 	if err != nil {
 		return fmt.Errorf("failed to listen on %s: %w", cfg.ListenAddress, err)
 	}
 
-	return serve(ctx, l, checker, registrar, logger)
+	if !cfg.RemoteEnabled() {
+		return serve(ctx, localListener, checker, registrar, logger)
+	}
+
+	remoteListener, err := tls.Listen("tcp", cfg.AgentListenAddress, remoteTLSConfig)
+	if err != nil {
+		localListener.Close()
+		return fmt.Errorf("failed to listen on agent address %s: %w", cfg.AgentListenAddress, err)
+	}
+
+	return serveDual(ctx, localListener, remoteListener, checker, registrar, authenticator, logger)
+}
+
+func buildRemoteTLSConfig(certFile, keyFile string) (*tls.Config, error) {
+	cert, err := tls.LoadX509KeyPair(certFile, keyFile)
+	if err != nil {
+		return nil, fmt.Errorf("failed to load agent TLS certificate: %w", err)
+	}
+	return &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{cert},
+		ClientAuth:   tls.RequestClientCert,
+	}, nil
 }

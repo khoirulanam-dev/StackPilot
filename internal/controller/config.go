@@ -18,15 +18,25 @@ const (
 
 // Config represents the validated runtime configuration for the controller.
 type Config struct {
-	ListenAddress string
-	LogLevel      slog.Level
-	DatabaseURL   string
+	ListenAddress      string
+	LogLevel           slog.Level
+	DatabaseURL        string
+	AgentListenAddress string
+	AgentTLSCertFile   string
+	AgentTLSKeyFile    string
+}
+
+// RemoteEnabled returns true if remote Agent transport listener is configured.
+func (cfg Config) RemoteEnabled() bool {
+	return cfg.AgentListenAddress != ""
 }
 
 // LogValue implements slog.LogValuer to ensure secrets are never serialized into logs.
 func (cfg Config) LogValue() slog.Value {
 	return slog.GroupValue(
 		slog.String("listen_address", cfg.ListenAddress),
+		slog.String("agent_listen_address", cfg.AgentListenAddress),
+		slog.Bool("agent_tls_enabled", cfg.RemoteEnabled()),
 		slog.String("log_level", cfg.LogLevel.String()),
 		slog.String("database_url", "[REDACTED]"),
 	)
@@ -52,7 +62,21 @@ func (cfg Config) validate() error {
 	if cfg.DatabaseURL == "" {
 		return fmt.Errorf("invalid STACKPILOT_DATABASE_URL: cannot be empty")
 	}
-	return validateDatabaseURL(cfg.DatabaseURL)
+	if err := validateDatabaseURL(cfg.DatabaseURL); err != nil {
+		return err
+	}
+	if cfg.AgentListenAddress != "" {
+		if err := validateAgentListenAddress(cfg.AgentListenAddress); err != nil {
+			return fmt.Errorf("invalid STACKPILOT_AGENT_LISTEN_ADDRESS: %w", err)
+		}
+		if cfg.AgentTLSCertFile == "" {
+			return fmt.Errorf("invalid STACKPILOT_AGENT_TLS_CERT_FILE: cannot be empty when STACKPILOT_AGENT_LISTEN_ADDRESS is configured")
+		}
+		if cfg.AgentTLSKeyFile == "" {
+			return fmt.Errorf("invalid STACKPILOT_AGENT_TLS_KEY_FILE: cannot be empty when STACKPILOT_AGENT_LISTEN_ADDRESS is configured")
+		}
+	}
+	return nil
 }
 
 func validateLogLevel(level slog.Level) error {
@@ -101,6 +125,24 @@ func LoadConfig() (Config, error) {
 		cfg.LogLevel = level
 	}
 
+	if val, ok := os.LookupEnv("STACKPILOT_AGENT_LISTEN_ADDRESS"); ok {
+		if val == "" {
+			return Config{}, fmt.Errorf("invalid STACKPILOT_AGENT_LISTEN_ADDRESS: cannot be empty")
+		}
+		if err := validateAgentListenAddress(val); err != nil {
+			return Config{}, fmt.Errorf("invalid STACKPILOT_AGENT_LISTEN_ADDRESS: %w", err)
+		}
+		cfg.AgentListenAddress = val
+	}
+
+	if val, ok := os.LookupEnv("STACKPILOT_AGENT_TLS_CERT_FILE"); ok {
+		cfg.AgentTLSCertFile = val
+	}
+
+	if val, ok := os.LookupEnv("STACKPILOT_AGENT_TLS_KEY_FILE"); ok {
+		cfg.AgentTLSKeyFile = val
+	}
+
 	if err := cfg.validate(); err != nil {
 		return Config{}, fmt.Errorf("invalid controller configuration: %w", err)
 	}
@@ -126,6 +168,25 @@ func validateListenAddress(addr string) error {
 
 	if !ip.IsLoopback() {
 		return fmt.Errorf("address must use a loopback IP")
+	}
+
+	return nil
+}
+
+func validateAgentListenAddress(addr string) error {
+	host, portStr, err := net.SplitHostPort(addr)
+	if err != nil {
+		return fmt.Errorf("must be a valid host:port string: %w", err)
+	}
+
+	port, err := strconv.Atoi(portStr)
+	if err != nil || port < 1 || port > 65535 {
+		return fmt.Errorf("port must be an integer between 1 and 65535")
+	}
+
+	_, err = netip.ParseAddr(host)
+	if err != nil {
+		return fmt.Errorf("host must be a literal IP address: %w", err)
 	}
 
 	return nil

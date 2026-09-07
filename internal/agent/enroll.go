@@ -27,7 +27,8 @@ const (
 	EnrollmentEndpointPath = "/api/v1/agent/enroll"
 )
 
-// ValidateControllerURL ensures that controller URL points to a literal loopback IP and valid port.
+// ValidateControllerURL ensures that controller URL points to a literal loopback IP (http)
+// or DNS hostname / literal IP (https), with valid scheme and port.
 func ValidateControllerURL(rawURL string) (*url.URL, error) {
 	if rawURL == "" {
 		return nil, errors.New("controller URL is required")
@@ -38,8 +39,8 @@ func ValidateControllerURL(rawURL string) (*url.URL, error) {
 		return nil, errors.New("invalid controller URL")
 	}
 
-	if u.Scheme != "http" {
-		return nil, errors.New("controller URL scheme must be http")
+	if u.Scheme != "http" && u.Scheme != "https" {
+		return nil, errors.New("controller URL scheme must be http or https")
 	}
 
 	if u.User != nil {
@@ -50,18 +51,13 @@ func ValidateControllerURL(rawURL string) (*url.URL, error) {
 		return nil, errors.New("controller URL must not contain query or fragment")
 	}
 
+	if u.Path != "" && u.Path != "/" {
+		return nil, errors.New("controller URL must not contain path")
+	}
+
 	hostname := u.Hostname()
 	if hostname == "" {
 		return nil, errors.New("controller URL missing host")
-	}
-
-	ip, err := netip.ParseAddr(hostname)
-	if err != nil {
-		return nil, errors.New("controller URL host must be a literal loopback IP address")
-	}
-
-	if !ip.IsLoopback() {
-		return nil, errors.New("controller URL host must be a loopback IP address")
 	}
 
 	portStr := u.Port()
@@ -71,6 +67,23 @@ func ValidateControllerURL(rawURL string) (*url.URL, error) {
 	port, err := strconv.Atoi(portStr)
 	if err != nil || port <= 0 || port > 65535 {
 		return nil, errors.New("controller URL port is invalid")
+	}
+
+	if u.Scheme == "http" {
+		ip, err := netip.ParseAddr(hostname)
+		if err != nil {
+			return nil, errors.New("controller URL host must be a literal loopback IP address")
+		}
+		if !ip.IsLoopback() {
+			return nil, errors.New("controller URL host must be a loopback IP address")
+		}
+	} else {
+		// HTTPS allows DNS hostname, literal IPv4, literal IPv6
+		if ip, err := netip.ParseAddr(hostname); err == nil {
+			if ip.IsUnspecified() {
+				return nil, errors.New("controller URL host cannot be unspecified IP address")
+			}
+		}
 	}
 
 	return u, nil
@@ -126,6 +139,7 @@ func ReadAndValidateTokenFromStdin(r io.Reader) (string, error) {
 type EnrollOptions struct {
 	ControllerURL string
 	StateDir      string
+	CAFile        string
 	TokenReader   io.Reader
 	EntropyReader io.Reader
 }
@@ -161,6 +175,10 @@ func Enroll(ctx context.Context, opts EnrollOptions) (string, error) {
 		return "", errors.New("token reader is required")
 	}
 
+	if opts.CAFile != "" && ctrlURL.Scheme != "https" {
+		return "", errors.New("--ca-file is permitted only with HTTPS controller URL")
+	}
+
 	// 1. Check existing identity metadata: fail closed on errors
 	metaPath := filepath.Join(opts.StateDir, IdentityJSONFileName)
 	if _, err := os.Lstat(metaPath); err == nil {
@@ -173,7 +191,14 @@ func Enroll(ctx context.Context, opts EnrollOptions) (string, error) {
 		return "", fmt.Errorf("failed to inspect existing agent identity metadata: %w", err)
 	}
 
-	// 2. Read and validate token from stdin
+	// 2. Persist CA file only after verifying no completed identity exists
+	if opts.CAFile != "" {
+		if err := ValidateAndPersistCAFile(opts.StateDir, opts.CAFile); err != nil {
+			return "", fmt.Errorf("failed to process CA file: %w", err)
+		}
+	}
+
+	// 3. Read and validate token from stdin
 	token, err := ReadAndValidateTokenFromStdin(opts.TokenReader)
 	if err != nil {
 		return "", err
@@ -186,13 +211,13 @@ func Enroll(ctx context.Context, opts EnrollOptions) (string, error) {
 	}
 	pubKeyStr := FormatPublicKeyBase64RawURL(pub)
 
-	// 4. Construct HTTP client with unconditional redirect rejection
-	client := &http.Client{
-		Timeout: HTTPClientTimeout,
-		CheckRedirect: func(req *http.Request, via []*http.Request) error {
-			return errors.New("http redirects are not permitted")
-		},
+	// 4. Construct HTTP client with controller trust roots and unconditional redirect rejection
+	rootCAs, err := LoadControllerTrustRoots(opts.StateDir)
+	if err != nil {
+		return "", fmt.Errorf("failed to load controller trust roots: %w", err)
 	}
+
+	client := BuildAgentHTTPClient(rootCAs, nil)
 
 	reqBody, err := json.Marshal(enrollRequest{
 		Token:     token,

@@ -5,7 +5,10 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.5 stage (Secure Agent Enrollment & Cryptographic Identity). It is **NOT** production-ready.
+StackPilot is currently in the M0.6 stage (Secure Remote Agent Transport). It is pre-release and **NOT** production-ready.
+- No heartbeat yet
+- No inventory
+- No remote commands
 
 ## Development
 To build and test the project locally, you need:
@@ -26,29 +29,47 @@ make web-build
 ```
 
 ### Controller Configuration
-The controller supports the following environment variables:
-- `STACKPILOT_LISTEN_ADDRESS` (default: `127.0.0.1:7447`): HTTP listen address (`host:port`). Accepts literal loopback IP and port only; remote and wildcard addresses are rejected while authentication is not implemented.
+
+#### Local Listener
+- `STACKPILOT_LISTEN_ADDRESS` (default: `127.0.0.1:7447`): HTTP listen address (`host:port`). Remains loopback HTTP only (`127.0.0.1` / `[::1]`). Remote and wildcard addresses are rejected.
 - `STACKPILOT_LOG_LEVEL` (default: `info`): Logging verbosity (`debug`, `info`, `warn`, `error`).
 - `STACKPILOT_DATABASE_URL` (**required**, no default): PostgreSQL connection URL (e.g. `postgres://user:password@127.0.0.1:5432/dbname?sslmode=disable`). Scheme must be `postgres` or `postgresql`.
 
-### Enrollment Tokens & Agent Enrollment
-Enrollment tokens can be generated locally via the controller CLI, and agents can enroll locally via loopback.
-Note that the StackPilot controller service (`stackpilot-controller`) must already be running on the configured loopback address before executing agent enrollment:
+#### Remote Agent Listener
+- `STACKPILOT_AGENT_LISTEN_ADDRESS`: Remote agent TLS listen address (`host:port`). Optional, disabled by default.
+- `STACKPILOT_AGENT_TLS_CERT_FILE`: Path to server X.509 certificate file for remote listener (required when remote listener is enabled).
+- `STACKPILOT_AGENT_TLS_KEY_FILE`: Path to server private key file for remote listener (required when remote listener is enabled).
 
+Remote listener properties:
+- Optional
+- Disabled by default
+- TLS 1.3 minimum
+- Requests client certificate for agent authentication (`/api/v1/agent/self`)
+
+### Agent Enrollment & Transport Check
+
+#### HTTPS Remote Enrollment
 ```bash
-# Issue an enrollment token and pipe directly to agent enroll
+# Issue token on controller and pipe directly to agent enroll over HTTPS
 stackpilot-controller enrollment-token create | \
 stackpilot-agent enroll \
-  --controller http://127.0.0.1:7447 \
-  --state-dir /path/to/agent/state
+  --controller https://controller.example.com:7448 \
+  --ca-file /path/internal-ca.pem \
+  --state-dir /path/state
 ```
 
-* In M0.5, the enrollment endpoint remains loopback-only (`127.0.0.1` / `[::1]`). Remote transport and mTLS will be introduced in subsequent milestones.
-* Requires configured PostgreSQL database connection (`STACKPILOT_DATABASE_URL`).
-* The plaintext token is read from stdin and is never stored on disk.
-* The Agent generates and stores a local Ed25519 private key in `--state-dir` with restrictive permissions (mode `0600`).
-* The private key never leaves the Agent host; only the 32-byte public key is sent to the controller.
-* Tokens are one-time use and valid for 15 minutes. Idempotent retry with the same token and same public key is supported.
+The enrollment token still comes from stdin.
+
+#### Verify Secure Transport
+```bash
+stackpilot-agent transport-check --state-dir /path/state
+```
+
+* Token is read from stdin and never written to disk.
+* Agent generates and stores an Ed25519 private key in `--state-dir` with restrictive permissions (mode `0600`).
+* Private key never leaves the agent host; only the public key is registered.
+* Ephemeral client certificates are generated in memory and never written to disk.
+* Controller authorizes agents via database lookup of the Ed25519 public key.
 
 ## Security
 StackPilot is designed to be security-first. Please see [SECURITY.md](SECURITY.md) for vulnerability reporting guidelines.

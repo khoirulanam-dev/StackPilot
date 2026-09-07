@@ -26,6 +26,8 @@ var (
 	ErrIdentityConflict = errors.New("agent identity conflict")
 	// ErrEnrollmentInternal is returned on unexpected internal persistence failure.
 	ErrEnrollmentInternal = errors.New("internal enrollment error")
+	// ErrAgentNotFound is returned when an Agent public key is not registered.
+	ErrAgentNotFound = errors.New("agent not found")
 )
 
 // AgentRecord represents safe domain metadata for an enrolled Agent.
@@ -38,6 +40,11 @@ type AgentRecord struct {
 // AgentRegistrar defines the contract for atomic token consumption and Agent registration.
 type AgentRegistrar interface {
 	RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*AgentRecord, bool, error)
+}
+
+// AgentFinder defines the contract for looking up an Agent by public key.
+type AgentFinder interface {
+	FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*AgentRecord, error)
 }
 
 // TokenRecord represents safe metadata returned after persisting an enrollment token.

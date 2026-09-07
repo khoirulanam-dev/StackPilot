@@ -359,6 +359,35 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("concurrency test failed: expected 1 winner and 1 rejection, got %d winners and %d rejections", winsCount, rejectCount)
 	}
 
+	// 16. M0.6: FindAgentByPublicKey
+	// 16a. Lookup existing agentA
+	foundAgent, err := db.FindAgentByPublicKey(ctx, keyA)
+	if err != nil {
+		t.Fatalf("failed to find agentA by public key: %v", err)
+	}
+	if foundAgent.ID != agentA.ID {
+		t.Fatalf("expected agent ID %q, got %q", agentA.ID, foundAgent.ID)
+	}
+	if !bytes.Equal(foundAgent.PublicKey[:], keyA[:]) {
+		t.Fatalf("expected public key to match keyA")
+	}
+
+	// 16b. Lookup unknown random public key -> ErrAgentNotFound
+	pubKeyUnknown, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate unknown key: %v", err)
+	}
+	var keyUnknown [32]byte
+	copy(keyUnknown[:], pubKeyUnknown)
+
+	_, err = db.FindAgentByPublicKey(ctx, keyUnknown)
+	if err == nil {
+		t.Fatal("expected ErrAgentNotFound for unknown public key, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrAgentNotFound) {
+		t.Fatalf("expected ErrAgentNotFound, got: %v", err)
+	}
+
 	// Ensure database created_at is reasonable
 	if startTime.After(time.Now().Add(5 * time.Second)) {
 		t.Errorf("startTime out of reasonable range")

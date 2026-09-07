@@ -26,11 +26,14 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runAgentDaemon(stdout)
 	}
 
-	if args[0] == "enroll" {
+	switch args[0] {
+	case "enroll":
 		return runEnroll(args[1:], stdin, stdout, stderr)
+	case "transport-check":
+		return runTransportCheck(args[1:], stdout, stderr)
+	default:
+		return fmt.Errorf("unknown command %q (supported: enroll, transport-check)", args[0])
 	}
-
-	return fmt.Errorf("unknown command %q (supported: enroll)", args[0])
 }
 
 func runAgentDaemon(stdout io.Writer) error {
@@ -45,8 +48,9 @@ func runEnroll(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	fs := flag.NewFlagSet("enroll", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
-	controllerURL := fs.String("controller", "", "Controller URL (e.g. http://127.0.0.1:7447)")
+	controllerURL := fs.String("controller", "", "Controller URL (e.g. http://127.0.0.1:7447 or https://controller.example.com:7448)")
 	stateDir := fs.String("state-dir", "", "Agent state directory for storing cryptographic identity")
+	caFile := fs.String("ca-file", "", "Optional custom CA certificate file for controller TLS verification")
 
 	if err := fs.Parse(args); err != nil {
 		return err
@@ -69,6 +73,7 @@ func runEnroll(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	opts := agent.EnrollOptions{
 		ControllerURL: *controllerURL,
 		StateDir:      *stateDir,
+		CAFile:        *caFile,
 		TokenReader:   stdin,
 	}
 
@@ -78,5 +83,35 @@ func runEnroll(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 	}
 
 	fmt.Fprintf(stdout, "Agent enrolled successfully: %s\n", agentID)
+	return nil
+}
+
+func runTransportCheck(args []string, stdout, stderr io.Writer) error {
+	fs := flag.NewFlagSet("transport-check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	stateDir := fs.String("state-dir", "", "Agent state directory containing enrolled cryptographic identity")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if fs.NArg() > 0 {
+		return errors.New("unexpected positional arguments")
+	}
+
+	if *stateDir == "" {
+		return fmt.Errorf("missing required flag --state-dir")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	agentID, err := agent.TransportCheck(ctx, *stateDir)
+	if err != nil {
+		return err
+	}
+
+	fmt.Fprintf(stdout, "Secure transport verified: %s\n", agentID)
 	return nil
 }

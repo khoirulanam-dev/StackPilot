@@ -231,6 +231,47 @@ func (db *DB) RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [
 	}, true, nil
 }
 
+// FindAgentByPublicKey queries stackpilot.agents for an Agent by 32-byte Ed25519 public key.
+// It returns enrollment.ErrAgentNotFound if no agent with the given public key exists.
+func (db *DB) FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*enrollment.AgentRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	const query = `
+		SELECT id::text, public_key, created_at
+		FROM stackpilot.agents
+		WHERE public_key = $1
+	`
+
+	var (
+		id        string
+		pubKey    []byte
+		createdAt time.Time
+	)
+
+	err := db.pool.QueryRow(ctx, query, publicKey[:]).Scan(&id, &pubKey, &createdAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, enrollment.ErrAgentNotFound
+		}
+		return nil, fmt.Errorf("failed to query agent: %w", sanitizeError(err))
+	}
+
+	if len(pubKey) != 32 {
+		return nil, fmt.Errorf("unexpected public key length in database: %d", len(pubKey))
+	}
+
+	var pub [32]byte
+	copy(pub[:], pubKey)
+
+	return &enrollment.AgentRecord{
+		ID:        id,
+		PublicKey: pub,
+		CreatedAt: createdAt,
+	}, nil
+}
+
 var (
 	passwordPattern = regexp.MustCompile(`(?i)(password=)[^\s&,]+`)
 	userinfoPattern = regexp.MustCompile(`(:)[^/@:]+(@)`)
