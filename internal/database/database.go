@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/protocol"
 )
 
 const (
@@ -313,6 +314,78 @@ func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, prot
 		LastSeenAt:      lastSeenAt,
 		ProtocolVersion: protocolVersionScanned,
 	}, nil
+}
+
+// RecordAgentInventory updates or inserts the agent's current host inventory snapshot in one database round trip.
+func (db *DB) RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error {
+	if db.pool == nil {
+		return fmt.Errorf("database pool is not initialized")
+	}
+	if req == nil {
+		return fmt.Errorf("inventory request is nil")
+	}
+
+	const query = `
+		WITH target_agent AS (
+			SELECT id
+			FROM stackpilot.agents
+			WHERE public_key = $1
+		),
+		upserted AS (
+			INSERT INTO stackpilot.agent_inventory (
+				agent_id,
+				hostname,
+				os_id,
+				os_name,
+				os_version,
+				kernel_release,
+				architecture,
+				cpu_logical_cores,
+				memory_total_bytes,
+				reported_at
+			)
+			SELECT
+				target_agent.id,
+				$2, $3, $4, $5, $6, $7, $8, $9,
+				now()
+			FROM target_agent
+			ON CONFLICT (agent_id)
+			DO UPDATE SET
+				hostname = EXCLUDED.hostname,
+				os_id = EXCLUDED.os_id,
+				os_name = EXCLUDED.os_name,
+				os_version = EXCLUDED.os_version,
+				kernel_release = EXCLUDED.kernel_release,
+				architecture = EXCLUDED.architecture,
+				cpu_logical_cores = EXCLUDED.cpu_logical_cores,
+				memory_total_bytes = EXCLUDED.memory_total_bytes,
+				reported_at = now()
+			RETURNING agent_id
+		)
+		SELECT agent_id
+		FROM upserted;
+	`
+
+	var agentID string
+	err := db.pool.QueryRow(ctx, query,
+		publicKey[:],
+		req.Hostname,
+		req.OSID,
+		req.OSName,
+		req.OSVersion,
+		req.KernelRelease,
+		req.Architecture,
+		req.CPULogicalCores,
+		req.MemoryTotalBytes,
+	).Scan(&agentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return enrollment.ErrAgentNotFound
+		}
+		return fmt.Errorf("failed to record agent inventory: %w", sanitizeError(err))
+	}
+
+	return nil
 }
 
 var (

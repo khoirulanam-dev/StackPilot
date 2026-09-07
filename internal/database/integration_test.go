@@ -13,6 +13,7 @@ import (
 	"time"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/protocol"
 )
 
 func TestPostgreSQLIntegration(t *testing.T) {
@@ -50,14 +51,14 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 4 (migrations 001, 002, 003, 004 applied)
+	// 5. Verify migration version is 5 (migrations 001, 002, 003, 004, 005 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("expected schema version 4, got %d", version)
+	if version != 5 {
+		t.Fatalf("expected schema version 5, got %d", version)
 	}
 
 	// 6. Run migration again (verify idempotence)
@@ -65,13 +66,13 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("second migration run failed: %v", err)
 	}
 
-	// 7. Verify version remains 4
+	// 7. Verify version remains 5
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 4 {
-		t.Fatalf("expected schema version to remain 4, got %d", version)
+	if version != 5 {
+		t.Fatalf("expected schema version to remain 5, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -468,6 +469,219 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 	if strings.Contains(err.Error(), "pgx") || strings.Contains(err.Error(), "sql") {
 		t.Fatalf("raw pgx/sql error leaked in error message: %v", err)
+	}
+
+	// Verify no inventory row exists for agent prior to first report
+	var initialCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_inventory WHERE agent_id = $1::uuid", agentH.ID).Scan(&initialCount)
+	if err != nil {
+		t.Fatalf("failed to query initial agent_inventory count: %v", err)
+	}
+	if initialCount != 0 {
+		t.Fatalf("expected 0 inventory rows before first submission, got %d", initialCount)
+	}
+
+	invReq1 := &protocol.InventoryRequest{
+		ProtocolVersion:  1,
+		Hostname:         "integration-node-01",
+		OSID:             "debian",
+		OSName:           "Debian GNU/Linux",
+		OSVersion:        "12",
+		KernelRelease:    "6.1.0-21-amd64",
+		Architecture:     "amd64",
+		CPULogicalCores:  4,
+		MemoryTotalBytes: 8589934592,
+	}
+
+	err = db.RecordAgentInventory(ctx, keyH, invReq1)
+	if err != nil {
+		t.Fatalf("RecordAgentInventory failed on first insert: %v", err)
+	}
+
+	// Verify stored columns match the reported inventory payload
+	var (
+		scannedAgentID   string
+		scannedHostname  string
+		scannedOSID      string
+		scannedOSName    string
+		scannedOSVersion string
+		scannedKernel    string
+		scannedArch      string
+		scannedCores     int
+		scannedMem       int64
+		firstReportedAt  time.Time
+	)
+	err = db.pool.QueryRow(ctx, `
+		SELECT agent_id, hostname, os_id, os_name, os_version, kernel_release, architecture, cpu_logical_cores, memory_total_bytes, reported_at
+		FROM stackpilot.agent_inventory
+		WHERE agent_id = $1::uuid
+	`, agentH.ID).Scan(
+		&scannedAgentID,
+		&scannedHostname,
+		&scannedOSID,
+		&scannedOSName,
+		&scannedOSVersion,
+		&scannedKernel,
+		&scannedArch,
+		&scannedCores,
+		&scannedMem,
+		&firstReportedAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to query agent_inventory: %v", err)
+	}
+	if scannedAgentID != agentH.ID {
+		t.Fatalf("expected agent_id %q, got %q", agentH.ID, scannedAgentID)
+	}
+	if scannedHostname != invReq1.Hostname {
+		t.Fatalf("expected hostname %q, got %q", invReq1.Hostname, scannedHostname)
+	}
+	if scannedOSID != invReq1.OSID {
+		t.Fatalf("expected os_id %q, got %q", invReq1.OSID, scannedOSID)
+	}
+	if scannedOSName != invReq1.OSName {
+		t.Fatalf("expected os_name %q, got %q", invReq1.OSName, scannedOSName)
+	}
+	if scannedOSVersion != invReq1.OSVersion {
+		t.Fatalf("expected os_version %q, got %q", invReq1.OSVersion, scannedOSVersion)
+	}
+	if scannedKernel != invReq1.KernelRelease {
+		t.Fatalf("expected kernel_release %q, got %q", invReq1.KernelRelease, scannedKernel)
+	}
+	if scannedArch != invReq1.Architecture {
+		t.Fatalf("expected architecture %q, got %q", invReq1.Architecture, scannedArch)
+	}
+	if scannedCores != invReq1.CPULogicalCores {
+		t.Fatalf("expected cpu_logical_cores %d, got %d", invReq1.CPULogicalCores, scannedCores)
+	}
+	if scannedMem != invReq1.MemoryTotalBytes {
+		t.Fatalf("expected memory_total_bytes %d, got %d", invReq1.MemoryTotalBytes, scannedMem)
+	}
+	if firstReportedAt.IsZero() {
+		t.Fatal("expected non-zero reported_at")
+	}
+
+	// Verify complete snapshot replacement: every mutable field is changed on second submission
+	invReq2 := &protocol.InventoryRequest{
+		ProtocolVersion:  1,
+		Hostname:         "integration-node-02-upgraded",
+		OSID:             "ubuntu",
+		OSName:           "Ubuntu Linux",
+		OSVersion:        "24.04",
+		KernelRelease:    "6.8.0-40-generic",
+		Architecture:     "arm64",
+		CPULogicalCores:  16,
+		MemoryTotalBytes: 34359738368,
+	}
+	err = db.RecordAgentInventory(ctx, keyH, invReq2)
+	if err != nil {
+		t.Fatalf("RecordAgentInventory failed on update: %v", err)
+	}
+
+	var (
+		scannedAgentID2   string
+		scannedHostname2  string
+		scannedOSID2      string
+		scannedOSName2    string
+		scannedOSVersion2 string
+		scannedKernel2    string
+		scannedArch2      string
+		scannedCores2     int
+		scannedMem2       int64
+		secondReportedAt  time.Time
+	)
+	err = db.pool.QueryRow(ctx, `
+		SELECT agent_id, hostname, os_id, os_name, os_version, kernel_release, architecture, cpu_logical_cores, memory_total_bytes, reported_at
+		FROM stackpilot.agent_inventory
+		WHERE agent_id = $1::uuid
+	`, agentH.ID).Scan(
+		&scannedAgentID2,
+		&scannedHostname2,
+		&scannedOSID2,
+		&scannedOSName2,
+		&scannedOSVersion2,
+		&scannedKernel2,
+		&scannedArch2,
+		&scannedCores2,
+		&scannedMem2,
+		&secondReportedAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to query updated agent_inventory: %v", err)
+	}
+
+	if scannedAgentID2 != agentH.ID {
+		t.Fatalf("expected agent_id unchanged (%q), got %q", agentH.ID, scannedAgentID2)
+	}
+	if scannedHostname2 != invReq2.Hostname {
+		t.Fatalf("expected hostname %q, got %q", invReq2.Hostname, scannedHostname2)
+	}
+	if scannedOSID2 != invReq2.OSID {
+		t.Fatalf("expected os_id %q, got %q", invReq2.OSID, scannedOSID2)
+	}
+	if scannedOSName2 != invReq2.OSName {
+		t.Fatalf("expected os_name %q, got %q", invReq2.OSName, scannedOSName2)
+	}
+	if scannedOSVersion2 != invReq2.OSVersion {
+		t.Fatalf("expected os_version %q, got %q", invReq2.OSVersion, scannedOSVersion2)
+	}
+	if scannedKernel2 != invReq2.KernelRelease {
+		t.Fatalf("expected kernel_release %q, got %q", invReq2.KernelRelease, scannedKernel2)
+	}
+	if scannedArch2 != invReq2.Architecture {
+		t.Fatalf("expected architecture %q, got %q", invReq2.Architecture, scannedArch2)
+	}
+	if scannedCores2 != invReq2.CPULogicalCores {
+		t.Fatalf("expected cpu_logical_cores %d, got %d", invReq2.CPULogicalCores, scannedCores2)
+	}
+	if scannedMem2 != invReq2.MemoryTotalBytes {
+		t.Fatalf("expected memory_total_bytes %d, got %d", invReq2.MemoryTotalBytes, scannedMem2)
+	}
+	if secondReportedAt.Before(firstReportedAt) {
+		t.Fatalf("expected second reported_at (%v) to be >= first (%v)", secondReportedAt, firstReportedAt)
+	}
+
+	// Table retains only current snapshot per agent (at most one row)
+	var rowCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_inventory WHERE agent_id = $1::uuid", agentH.ID).Scan(&rowCount)
+	if err != nil {
+		t.Fatalf("failed to count agent_inventory rows: %v", err)
+	}
+	if rowCount != 1 {
+		t.Fatalf("expected exactly 1 inventory snapshot row, got %d", rowCount)
+	}
+
+	// Reporting inventory for an unenrolled key must fail and leave table contents untouched
+	var totalBeforeUnknown int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_inventory").Scan(&totalBeforeUnknown)
+	if err != nil {
+		t.Fatalf("failed to count total agent_inventory rows before unknown attempt: %v", err)
+	}
+
+	err = db.RecordAgentInventory(ctx, keyUnknownH, invReq1)
+	if err == nil {
+		t.Fatal("expected error for unknown public key inventory, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrAgentNotFound) {
+		t.Fatalf("expected ErrAgentNotFound for unknown public key inventory, got %v", err)
+	}
+
+	var totalAfterUnknown int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_inventory").Scan(&totalAfterUnknown)
+	if err != nil {
+		t.Fatalf("failed to count total agent_inventory rows after unknown attempt: %v", err)
+	}
+	if totalAfterUnknown != totalBeforeUnknown {
+		t.Fatalf("expected total inventory row count to remain %d, got %d", totalBeforeUnknown, totalAfterUnknown)
+	}
+
+	var countAfterUnknown int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_inventory WHERE agent_id = $1::uuid", agentH.ID).Scan(&countAfterUnknown)
+	if err != nil {
+		t.Fatalf("failed to count agent_inventory rows after unknown attempt: %v", err)
+	}
+	if countAfterUnknown != 1 {
+		t.Fatalf("expected agent inventory row count to remain 1 after unknown attempt, got %d", countAfterUnknown)
 	}
 
 	// Ensure database created_at is reasonable

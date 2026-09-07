@@ -7,6 +7,8 @@ import (
 	"strings"
 	"testing"
 	"time"
+
+	"stackpilot/internal/protocol"
 )
 
 func TestConfigurePool(t *testing.T) {
@@ -140,6 +142,26 @@ func TestRecordAgentHeartbeat_Uninitialized(t *testing.T) {
 	db := &DB{}
 	var key [32]byte
 	_, err := db.RecordAgentHeartbeat(context.Background(), key, 1)
+	if err == nil {
+		t.Fatal("expected error on uninitialized pool, got nil")
+	}
+}
+
+func TestRecordAgentInventory_Uninitialized(t *testing.T) {
+	db := &DB{}
+	var key [32]byte
+	req := &protocol.InventoryRequest{
+		ProtocolVersion:  1,
+		Hostname:         "node-01",
+		OSID:             "linux",
+		OSName:           "Linux",
+		OSVersion:        "1.0",
+		KernelRelease:    "6.8.0",
+		Architecture:     "amd64",
+		CPULogicalCores:  4,
+		MemoryTotalBytes: 1024,
+	}
+	err := db.RecordAgentInventory(context.Background(), key, req)
 	if err == nil {
 		t.Fatal("expected error on uninitialized pool, got nil")
 	}

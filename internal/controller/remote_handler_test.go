@@ -40,6 +40,9 @@ type fakeAuthBackend struct {
 	heartbeatErr        error
 	lastHeartbeatKey    [32]byte
 	lastProtocolVersion int
+	inventoryErr        error
+	lastInventoryKey    [32]byte
+	lastInventoryReq    *protocol.InventoryRequest
 }
 
 func (f *fakeAuthBackend) RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*enrollment.AgentRecord, bool, error) {
@@ -100,6 +103,24 @@ func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [3
 		}
 	}
 	return nil, enrollment.ErrAgentNotFound
+}
+
+func (f *fakeAuthBackend) RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.inventoryErr != nil {
+		return f.inventoryErr
+	}
+
+	if f.agents != nil {
+		if _, ok := f.agents[publicKey]; ok {
+			f.lastInventoryKey = publicKey
+			f.lastInventoryReq = req
+			return nil
+		}
+	}
+	return enrollment.ErrAgentNotFound
 }
 
 func (f *fakeAuthBackend) Ping(ctx context.Context) error {
@@ -1083,5 +1104,597 @@ func TestRealTLSHeartbeat_E2E(t *testing.T) {
 	}
 	if backend.agents[key32].LastSeenAt == nil {
 		t.Fatal("backend record LastSeenAt was not updated")
+	}
+}
+
+func TestRemoteHandler_InventoryEndpoint(t *testing.T) {
+	now := time.Now()
+	backend := &fakeAuthBackend{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	handler := newRemoteHandler(logger, backend, backend)
+
+	// Enroll Agent A
+	_, _, validCertA := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+	pubKeyA := validCertA.PublicKey.(ed25519.PublicKey)
+	var keyA [32]byte
+	copy(keyA[:], pubKeyA)
+
+	const agentIDA = "018f0000-0000-7000-8000-000000000001"
+	backend.agents = map[[32]byte]*enrollment.AgentRecord{
+		keyA: {
+			ID:        agentIDA,
+			PublicKey: keyA,
+			CreatedAt: now.Add(-10 * time.Minute),
+		},
+	}
+
+	validReq := protocol.InventoryRequest{
+		ProtocolVersion:  protocol.CurrentVersion,
+		Hostname:         "node-01.example.internal",
+		OSID:             "ubuntu",
+		OSName:           "Ubuntu",
+		OSVersion:        "24.04",
+		KernelRelease:    "6.8.0-40-generic",
+		Architecture:     "amd64",
+		CPULogicalCores:  8,
+		MemoryTotalBytes: 16777216000,
+	}
+	validBodyBytes, _ := json.Marshal(validReq)
+	validBody := string(validBodyBytes)
+
+	t.Run("plaintext_put_inventory_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for plaintext inventory, got %d", rec.Code)
+		}
+	})
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		t.Run("method_not_allowed_"+method, func(t *testing.T) {
+			req := httptest.NewRequest(method, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+			req.TLS = &tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{validCertA},
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
+			}
+			if allow := rec.Header().Get("Allow"); allow != "PUT" {
+				t.Errorf("expected Allow: PUT header, got %q", allow)
+			}
+		})
+	}
+
+	t.Run("missing_client_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: nil}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unknown_agent_rejected", func(t *testing.T) {
+		_, _, unknownCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{unknownCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
+
+	t.Run("wrong_key_type_rejected", func(t *testing.T) {
+		_, ecdsaCert := helperGenerateECDSACert(t)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{ecdsaCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for ECDSA cert, got %d", rec.Code)
+		}
+	})
+
+	t.Run("expired_client_cert_rejected", func(t *testing.T) {
+		_, _, expiredCert := helperGenerateEd25519Cert(t, now.Add(-2*time.Hour), now.Add(-1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{expiredCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for expired cert, got %d", rec.Code)
+		}
+	})
+
+	t.Run("future_client_cert_rejected", func(t *testing.T) {
+		_, _, futureCert := helperGenerateEd25519Cert(t, now.Add(1*time.Hour), now.Add(2*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{futureCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for future cert, got %d", rec.Code)
+		}
+	})
+
+	t.Run("wrong_eku_rejected", func(t *testing.T) {
+		_, _, serverOnlyCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, "", nil)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{serverOnlyCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for server auth only cert, got %d", rec.Code)
+		}
+	})
+
+	// Authorization relies solely on the authenticated Ed25519 public key.
+	// CommonName and SAN values claiming another agent identity must not grant authorization.
+	t.Run("cert_text_impersonation_rejected", func(t *testing.T) {
+		backend.lastInventoryKey = [32]byte{}
+		backend.lastInventoryReq = nil
+
+		_, _, imposterCert := helperGenerateEd25519Cert(t, now.Add(-5*time.Minute), now.Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, agentIDA, []string{agentIDA, "node-01.example.internal"})
+		imposterReq := validReq
+		imposterReq.Hostname = "imposter-host"
+		imposterBody, _ := json.Marshal(imposterReq)
+
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(imposterBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{imposterCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized for unenrolled key B impersonating Agent A, got %d", rec.Code)
+		}
+		if backend.lastInventoryKey == keyA {
+			t.Fatalf("Agent A inventory was updated by imposter certificate with key B!")
+		}
+		if backend.lastInventoryReq != nil {
+			t.Fatalf("backend recorded inventory for unauthorized request: %+v", backend.lastInventoryReq)
+		}
+	})
+
+	t.Run("invalid_content_type", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "text/plain")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for text/plain, got %d", rec.Code)
+		}
+	})
+
+	t.Run("invalid_charset", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json; charset=iso-8859-1")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for iso-8859-1 charset, got %d", rec.Code)
+		}
+	})
+
+	t.Run("body_too_large", func(t *testing.T) {
+		largeBody := strings.Repeat("a", 8193)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(largeBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for body > 8192 bytes, got %d", rec.Code)
+		}
+	})
+
+	// Malformed raw UTF-8 must be rejected at the HTTP boundary before JSON decoding
+	// can silently replace invalid sequences with U+FFFD.
+	t.Run("invalid_raw_utf8_rejected", func(t *testing.T) {
+		backend.lastInventoryKey = [32]byte{}
+		backend.lastInventoryReq = nil
+
+		rawInvalidUTF8Body := []byte(`{"protocol_version":1,"hostname":"valid-node","os_id":"ubuntu","os_name":"Ubuntu` + "\xff" + `Linux","os_version":"24.04","kernel_release":"6.8.0","architecture":"amd64","cpu_logical_cores":4,"memory_total_bytes":8192000}`)
+
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(rawInvalidUTF8Body))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 Bad Request for raw invalid UTF-8, got %d (body: %s)", rec.Code, rec.Body.String())
+		}
+		var errResp map[string]string
+		if err := json.Unmarshal(rec.Body.Bytes(), &errResp); err != nil {
+			t.Fatalf("failed to decode error response: %v", err)
+		}
+		if errResp["error"] != "invalid request body" {
+			t.Fatalf("expected generic safe error 'invalid request body', got %q", errResp["error"])
+		}
+		if backend.lastInventoryReq != nil || backend.lastInventoryKey != [32]byte{} {
+			t.Fatal("backend RecordAgentInventory was invoked for invalid UTF-8 payload")
+		}
+	})
+
+	t.Run("malformed_json", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(`{"protocol_version":`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for malformed json, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unknown_field", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra": "forbidden"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for unknown field, got %d", rec.Code)
+		}
+	})
+
+	t.Run("trailing_data", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody+`{"second": 1}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for trailing data, got %d", rec.Code)
+		}
+	})
+
+	// 8. Protocol version checks
+	t.Run("protocol_version_zero", func(t *testing.T) {
+		badReq := validReq
+		badReq.ProtocolVersion = 0
+		badBytes, _ := json.Marshal(badReq)
+
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(badBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for protocol_version 0, got %d", rec.Code)
+		}
+	})
+
+	t.Run("protocol_version_mismatch", func(t *testing.T) {
+		badReq := validReq
+		badReq.ProtocolVersion = 2
+		badBytes, _ := json.Marshal(badReq)
+
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(badBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 Conflict for unsupported protocol, got %d", rec.Code)
+		}
+	})
+
+	testCases := []struct {
+		name    string
+		mutate  func(*protocol.InventoryRequest)
+		expCode int
+	}{
+		{"empty_hostname", func(r *protocol.InventoryRequest) { r.Hostname = "" }, http.StatusBadRequest},
+		{"long_hostname", func(r *protocol.InventoryRequest) { r.Hostname = strings.Repeat("h", 256) }, http.StatusBadRequest},
+		{"hostname_with_null", func(r *protocol.InventoryRequest) { r.Hostname = "host\x00name" }, http.StatusBadRequest},
+		{"hostname_with_newline", func(r *protocol.InventoryRequest) { r.Hostname = "host\nname" }, http.StatusBadRequest},
+		{"hostname_leading_space", func(r *protocol.InventoryRequest) { r.Hostname = " hostname" }, http.StatusBadRequest},
+		{"hostname_trailing_space", func(r *protocol.InventoryRequest) { r.Hostname = "hostname " }, http.StatusBadRequest},
+
+		{"empty_os_id", func(r *protocol.InventoryRequest) { r.OSID = "" }, http.StatusBadRequest},
+		{"uppercase_os_id", func(r *protocol.InventoryRequest) { r.OSID = "Ubuntu" }, http.StatusBadRequest},
+		{"space_in_os_id", func(r *protocol.InventoryRequest) { r.OSID = "os id" }, http.StatusBadRequest},
+		{"invalid_char_os_id", func(r *protocol.InventoryRequest) { r.OSID = "os@id" }, http.StatusBadRequest},
+		{"long_os_id", func(r *protocol.InventoryRequest) { r.OSID = strings.Repeat("o", 65) }, http.StatusBadRequest},
+
+		{"empty_os_name", func(r *protocol.InventoryRequest) { r.OSName = "" }, http.StatusBadRequest},
+		{"long_os_name", func(r *protocol.InventoryRequest) { r.OSName = strings.Repeat("n", 129) }, http.StatusBadRequest},
+		{"os_name_control_char", func(r *protocol.InventoryRequest) { r.OSName = "OS\tName" }, http.StatusBadRequest},
+
+		{"empty_os_version_allowed", func(r *protocol.InventoryRequest) { r.OSVersion = "" }, http.StatusNoContent},
+		{"long_os_version", func(r *protocol.InventoryRequest) { r.OSVersion = strings.Repeat("v", 129) }, http.StatusBadRequest},
+		{"os_version_control_char", func(r *protocol.InventoryRequest) { r.OSVersion = "1.0\r" }, http.StatusBadRequest},
+
+		{"empty_kernel_release", func(r *protocol.InventoryRequest) { r.KernelRelease = "" }, http.StatusBadRequest},
+		{"long_kernel_release", func(r *protocol.InventoryRequest) { r.KernelRelease = strings.Repeat("k", 129) }, http.StatusBadRequest},
+
+		{"empty_architecture", func(r *protocol.InventoryRequest) { r.Architecture = "" }, http.StatusBadRequest},
+		{"long_architecture", func(r *protocol.InventoryRequest) { r.Architecture = strings.Repeat("a", 33) }, http.StatusBadRequest},
+
+		{"zero_cpu_cores", func(r *protocol.InventoryRequest) { r.CPULogicalCores = 0 }, http.StatusBadRequest},
+		{"negative_cpu_cores", func(r *protocol.InventoryRequest) { r.CPULogicalCores = -1 }, http.StatusBadRequest},
+		{"excessive_cpu_cores", func(r *protocol.InventoryRequest) { r.CPULogicalCores = 1048577 }, http.StatusBadRequest},
+
+		{"zero_memory", func(r *protocol.InventoryRequest) { r.MemoryTotalBytes = 0 }, http.StatusBadRequest},
+		{"negative_memory", func(r *protocol.InventoryRequest) { r.MemoryTotalBytes = -100 }, http.StatusBadRequest},
+	}
+
+	for _, tc := range testCases {
+		t.Run("validation_"+tc.name, func(t *testing.T) {
+			r := validReq
+			tc.mutate(&r)
+			data, _ := json.Marshal(r)
+
+			req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(data))
+			req.Header.Set("Content-Type", "application/json")
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != tc.expCode {
+				t.Fatalf("expected code %d for %s, got %d (body: %s)", tc.expCode, tc.name, rec.Code, rec.Body.String())
+			}
+		})
+	}
+
+	t.Run("success_returns_204", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 No Content, got %d", rec.Code)
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("expected Cache-Control: no-store, got %q", cc)
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("expected empty body for 204, got %d bytes", rec.Body.Len())
+		}
+		if backend.lastInventoryKey != keyA {
+			t.Errorf("backend key mismatch: got %x, want %x", backend.lastInventoryKey, keyA)
+		}
+		if backend.lastInventoryReq == nil || backend.lastInventoryReq.Hostname != validReq.Hostname {
+			t.Errorf("backend inventory request mismatch: got %+v", backend.lastInventoryReq)
+		}
+	})
+
+	t.Run("database_failure_returns_500", func(t *testing.T) {
+		backend.inventoryErr = errors.New("db connection down")
+		defer func() { backend.inventoryErr = nil }()
+
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 for database error, got %d", rec.Code)
+		}
+	})
+
+	t.Run("local_listener_has_no_inventory_route", func(t *testing.T) {
+		localHandler := newHandler(logger, backend, backend)
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		localHandler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNotFound {
+			t.Fatalf("expected 404 for inventory on local listener, got %d", rec.Code)
+		}
+	})
+}
+
+func TestRealTLSInventory_E2E(t *testing.T) {
+	caPub, caPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(600),
+		Subject:               pkix.Name{CommonName: "StackPilot Real TLS Inventory CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create CA cert: %v", err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	srvPub, srvPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate srv key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(601),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, srvPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create srv cert: %v", err)
+	}
+	srvTLSCert := tls.Certificate{
+		Certificate: [][]byte{srvDER},
+		PrivateKey:  srvPriv,
+	}
+
+	backend := &fakeAuthBackend{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	remoteHandler := newRemoteHandler(logger, backend, backend)
+
+	ts := httptest.NewUnstartedServer(remoteHandler)
+	ts.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{srvTLSCert},
+		ClientAuth:   tls.RequestClientCert,
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	tempDir := t.TempDir()
+	stateDir := filepath.Join(tempDir, "state")
+	if err := agent.EnsureStateDir(stateDir); err != nil {
+		t.Fatalf("EnsureStateDir failed: %v", err)
+	}
+
+	pub, priv, err := agent.LoadOrGenerateKey(stateDir, rand.Reader)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey failed: %v", err)
+	}
+
+	var key32 [32]byte
+	copy(key32[:], pub)
+
+	const agentID = "018f0000-0000-7000-8000-000000000077"
+	backend.agents = map[[32]byte]*enrollment.AgentRecord{
+		key32: {
+			ID:        agentID,
+			PublicKey: key32,
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	meta := &agent.IdentityMetadata{
+		Version:       1,
+		AgentID:       agentID,
+		ControllerURL: ts.URL,
+		PublicKey:     agent.FormatPublicKeyBase64RawURL(pub),
+	}
+	if err := agent.WriteIdentityMetadata(stateDir, meta); err != nil {
+		t.Fatalf("WriteIdentityMetadata failed: %v", err)
+	}
+
+	caPath := filepath.Join(tempDir, "controller-ca.pem")
+	if err := os.WriteFile(caPath, caPEM, 0644); err != nil {
+		t.Fatalf("failed to write CA file: %v", err)
+	}
+	if err := agent.ValidateAndPersistCAFile(stateDir, caPath); err != nil {
+		t.Fatalf("ValidateAndPersistCAFile failed: %v", err)
+	}
+
+	clientCert, err := agent.BuildEphemeralClientCert(priv)
+	if err != nil {
+		t.Fatalf("BuildEphemeralClientCert failed: %v", err)
+	}
+
+	rootCAs, err := agent.LoadControllerTrustRoots(stateDir)
+	if err != nil {
+		t.Fatalf("LoadControllerTrustRoots failed: %v", err)
+	}
+
+	client := agent.BuildAgentHTTPClient(rootCAs, &clientCert)
+
+	invURL := ts.URL + protocol.InventoryEndpointPath
+	invReq := protocol.InventoryRequest{
+		ProtocolVersion:  protocol.CurrentVersion,
+		Hostname:         "node-tls-e2e.example.internal",
+		OSID:             "debian",
+		OSName:           "Debian GNU/Linux",
+		OSVersion:        "12",
+		KernelRelease:    "6.1.0-21-amd64",
+		Architecture:     "amd64",
+		CPULogicalCores:  4,
+		MemoryTotalBytes: 8589934592,
+	}
+	payload, err := json.Marshal(invReq)
+	if err != nil {
+		t.Fatalf("failed to marshal inventory request: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, invURL, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("failed to construct HTTP request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("real TLS inventory request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content, got %d", resp.StatusCode)
+	}
+
+	// 7. Verify backend received the correct public key and exact inventory values
+	if backend.lastInventoryKey != key32 {
+		t.Errorf("backend received key mismatch: got %x, want %x", backend.lastInventoryKey, key32)
+	}
+	if backend.lastInventoryReq == nil {
+		t.Fatal("backend lastInventoryReq is nil")
+	}
+	if backend.lastInventoryReq.ProtocolVersion != invReq.ProtocolVersion {
+		t.Errorf("protocol version mismatch: got %d, want %d", backend.lastInventoryReq.ProtocolVersion, invReq.ProtocolVersion)
+	}
+	if backend.lastInventoryReq.Hostname != invReq.Hostname {
+		t.Errorf("hostname mismatch: got %q, want %q", backend.lastInventoryReq.Hostname, invReq.Hostname)
+	}
+	if backend.lastInventoryReq.OSID != invReq.OSID {
+		t.Errorf("os_id mismatch: got %q, want %q", backend.lastInventoryReq.OSID, invReq.OSID)
+	}
+	if backend.lastInventoryReq.OSName != invReq.OSName {
+		t.Errorf("os_name mismatch: got %q, want %q", backend.lastInventoryReq.OSName, invReq.OSName)
+	}
+	if backend.lastInventoryReq.OSVersion != invReq.OSVersion {
+		t.Errorf("os_version mismatch: got %q, want %q", backend.lastInventoryReq.OSVersion, invReq.OSVersion)
+	}
+	if backend.lastInventoryReq.KernelRelease != invReq.KernelRelease {
+		t.Errorf("kernel_release mismatch: got %q, want %q", backend.lastInventoryReq.KernelRelease, invReq.KernelRelease)
+	}
+	if backend.lastInventoryReq.Architecture != invReq.Architecture {
+		t.Errorf("architecture mismatch: got %q, want %q", backend.lastInventoryReq.Architecture, invReq.Architecture)
+	}
+	if backend.lastInventoryReq.CPULogicalCores != invReq.CPULogicalCores {
+		t.Errorf("cpu_logical_cores mismatch: got %d, want %d", backend.lastInventoryReq.CPULogicalCores, invReq.CPULogicalCores)
+	}
+	if backend.lastInventoryReq.MemoryTotalBytes != invReq.MemoryTotalBytes {
+		t.Errorf("memory_total_bytes mismatch: got %d, want %d", backend.lastInventoryReq.MemoryTotalBytes, invReq.MemoryTotalBytes)
 	}
 }

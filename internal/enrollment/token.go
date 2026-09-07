@@ -10,6 +10,8 @@ import (
 	"io"
 	"strings"
 	"time"
+
+	"stackpilot/internal/protocol"
 )
 
 const (
@@ -52,6 +54,11 @@ type AgentFinder interface {
 // AgentHeartbeatRecorder defines the contract for recording an Agent heartbeat.
 type AgentHeartbeatRecorder interface {
 	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*AgentRecord, error)
+}
+
+// AgentInventoryRecorder defines the contract for recording Agent inventory.
+type AgentInventoryRecorder interface {
+	RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error
 }
 
 // TokenRecord represents safe metadata returned after persisting an enrollment token.

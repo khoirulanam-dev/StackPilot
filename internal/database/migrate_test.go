@@ -11,8 +11,8 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatalf("getEmbeddedMigrations() failed: %v", err)
 	}
 
-	if len(migrations) != 4 {
-		t.Fatalf("expected exactly 4 migrations, got %d", len(migrations))
+	if len(migrations) != 5 {
+		t.Fatalf("expected exactly 5 migrations, got %d", len(migrations))
 	}
 
 	// Verify exact migration order
@@ -20,6 +20,7 @@ func TestEmbeddedMigrations(t *testing.T) {
 	expected002 := "002_create_enrollment_tokens.sql"
 	expected003 := "003_create_agents.sql"
 	expected004 := "004_add_agent_presence.sql"
+	expected005 := "005_create_agent_inventory.sql"
 
 	if migrations[0] != expected001 {
 		t.Errorf("expected first migration %q, got %q", expected001, migrations[0])
@@ -32,6 +33,9 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if migrations[3] != expected004 {
 		t.Errorf("expected fourth migration %q, got %q", expected004, migrations[3])
+	}
+	if migrations[4] != expected005 {
+		t.Errorf("expected fifth migration %q, got %q", expected005, migrations[4])
 	}
 
 	// Verify migration 001 contents
@@ -163,6 +167,58 @@ func TestEmbeddedMigrations(t *testing.T) {
 	for _, keyword := range prohibitedKeywords004 {
 		if strings.Contains(normalized004, keyword) {
 			t.Errorf("migration 004 contains prohibited term %q", keyword)
+		}
+	}
+
+	// Verify migration 005 contents
+	content005, err := migrationsFS.ReadFile("migrations/" + expected005)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected005, err)
+	}
+	sql005 := string(content005)
+
+	requiredClauses005 := []string{
+		"CREATE TABLE stackpilot.agent_inventory",
+		"agent_id uuid PRIMARY KEY REFERENCES stackpilot.agents(id) ON DELETE CASCADE",
+		"hostname text NOT NULL",
+		"os_id text NOT NULL",
+		"os_name text NOT NULL",
+		"os_version text NOT NULL",
+		"kernel_release text NOT NULL",
+		"architecture text NOT NULL",
+		"cpu_logical_cores integer NOT NULL",
+		"memory_total_bytes bigint NOT NULL",
+		"reported_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT agent_inventory_hostname_check",
+		"CONSTRAINT agent_inventory_os_id_check",
+		"CONSTRAINT agent_inventory_os_name_check",
+		"CONSTRAINT agent_inventory_os_version_check",
+		"CONSTRAINT agent_inventory_kernel_release_check",
+		"CONSTRAINT agent_inventory_architecture_check",
+		"CONSTRAINT agent_inventory_cpu_logical_cores_check",
+		"CONSTRAINT agent_inventory_memory_total_bytes_check",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.agent_inventory;",
+	}
+	for _, clause := range requiredClauses005 {
+		if !strings.Contains(sql005, clause) {
+			t.Errorf("migration 005 missing required clause %q", clause)
+		}
+	}
+
+	normalized005 := strings.ToLower(sql005)
+	prohibitedKeywords005 := []string{
+		"jsonb",
+		"raw_payload",
+		"ip_addresses",
+		"mac_addresses",
+		"collected_at",
+		"updated_at",
+		"metrics",
+	}
+	for _, keyword := range prohibitedKeywords005 {
+		if strings.Contains(normalized005, keyword) {
+			t.Errorf("migration 005 contains prohibited term %q", keyword)
 		}
 	}
 }

@@ -135,26 +135,32 @@ func (cm *certManager) close() {
 
 // presenceConfig exposes deterministic seams for unit and integration testing.
 type presenceConfig struct {
-	nowFunc       func() time.Time
-	timerFunc     func(d time.Duration) (<-chan time.Time, func() bool)
-	jitterFunc    func(base time.Duration, pct float64) time.Duration
-	randReader    io.Reader
-	refreshMargin time.Duration
-	baseInterval  time.Duration
-	maxBackoff    time.Duration
-	clientBuilder func(rootCAs *x509.CertPool, cert *tls.Certificate) *http.Client
+	nowFunc                func() time.Time
+	timerFunc              func(d time.Duration) (<-chan time.Time, func() bool)
+	jitterFunc             func(base time.Duration, pct float64) time.Duration
+	randReader             io.Reader
+	refreshMargin          time.Duration
+	baseInterval           time.Duration
+	maxBackoff             time.Duration
+	clientBuilder          func(rootCAs *x509.CertPool, cert *tls.Certificate) *http.Client
+	inventoryInterval      time.Duration
+	inventoryRetryInterval time.Duration
+	collector              func() (*protocol.InventoryRequest, error)
 }
 
 func defaultPresenceConfig() presenceConfig {
 	return presenceConfig{
-		nowFunc:       time.Now,
-		timerFunc:     realTimer,
-		jitterFunc:    defaultJitter,
-		randReader:    rand.Reader,
-		refreshMargin: DefaultCertRefreshMargin,
-		baseInterval:  DefaultHeartbeatInterval,
-		maxBackoff:    DefaultMaxBackoff,
-		clientBuilder: BuildAgentHTTPClient,
+		nowFunc:                time.Now,
+		timerFunc:              realTimer,
+		jitterFunc:             defaultJitter,
+		randReader:             rand.Reader,
+		refreshMargin:          DefaultCertRefreshMargin,
+		baseInterval:           DefaultHeartbeatInterval,
+		maxBackoff:             DefaultMaxBackoff,
+		clientBuilder:          BuildAgentHTTPClient,
+		inventoryInterval:      DefaultInventoryInterval,
+		inventoryRetryInterval: DefaultInventoryRetryInterval,
+		collector:              collectLinuxInventory,
 	}
 }
 
@@ -251,9 +257,13 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 	}
 
 	heartbeatURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.HeartbeatEndpointPath}).String()
+	inventoryURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.InventoryEndpointPath}).String()
 
 	consecutiveFailures := 0
 	loggedFailure := false
+
+	var nextInventoryAt time.Time
+	inventoryFailureLogged := false
 
 	for {
 		if ctx.Err() != nil {
@@ -305,6 +315,77 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 				loggedFailure = false
 			}
 			consecutiveFailures = 0
+
+			now := cfg.nowFunc()
+			if nextInventoryAt.IsZero() || !now.Before(nextInventoryAt) {
+				var invReport *protocol.InventoryRequest
+				var collectErr error
+				if cfg.collector != nil {
+					invReport, collectErr = cfg.collector()
+				} else {
+					invReport, collectErr = collectLinuxInventory()
+				}
+
+				if collectErr != nil {
+					if !inventoryFailureLogged {
+						if logger != nil {
+							logger.Warn("agent inventory collection failed; will retry", "error", collectErr)
+						}
+						inventoryFailureLogged = true
+					}
+					retryDur := cfg.inventoryRetryInterval
+					if retryDur <= 0 {
+						retryDur = DefaultInventoryRetryInterval
+					}
+					if cfg.jitterFunc != nil {
+						retryDur = cfg.jitterFunc(retryDur, 0.10)
+					}
+					nextInventoryAt = now.Add(retryDur)
+				} else {
+					invErr := sendInventory(ctx, client, inventoryURL, invReport)
+					if invErr != nil {
+						if ctx.Err() != nil {
+							return nil
+						}
+						if IsPermanentError(invErr) {
+							if logger != nil {
+								logger.Error("permanent inventory failure; stopping daemon", "error", invErr)
+							}
+							return invErr
+						}
+
+						if !inventoryFailureLogged {
+							if logger != nil {
+								logger.Warn("agent inventory delivery failed; will retry", "error", invErr)
+							}
+							inventoryFailureLogged = true
+						}
+						retryDur := cfg.inventoryRetryInterval
+						if retryDur <= 0 {
+							retryDur = DefaultInventoryRetryInterval
+						}
+						if cfg.jitterFunc != nil {
+							retryDur = cfg.jitterFunc(retryDur, 0.10)
+						}
+						nextInventoryAt = now.Add(retryDur)
+					} else {
+						if inventoryFailureLogged {
+							if logger != nil {
+								logger.Info("agent inventory delivery recovered", "agent_id", meta.AgentID)
+							}
+							inventoryFailureLogged = false
+						}
+						interval := cfg.inventoryInterval
+						if interval <= 0 {
+							interval = DefaultInventoryInterval
+						}
+						if cfg.jitterFunc != nil {
+							interval = cfg.jitterFunc(interval, 0.10)
+						}
+						nextInventoryAt = now.Add(interval)
+					}
+				}
+			}
 
 			waitDur := cfg.baseInterval
 			if cfg.jitterFunc != nil {
