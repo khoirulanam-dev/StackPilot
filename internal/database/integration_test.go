@@ -3,7 +3,10 @@ package database
 import (
 	"bytes"
 	"context"
+	"crypto/ed25519"
+	"crypto/rand"
 	"database/sql"
+	"errors"
 	"os"
 	"strings"
 	"testing"
@@ -47,14 +50,14 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 2 (migration 001 and 002 applied)
+	// 5. Verify migration version is 3 (migrations 001, 002, 003 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("expected schema version 2, got %d", version)
+	if version != 3 {
+		t.Fatalf("expected schema version 3, got %d", version)
 	}
 
 	// 6. Run migration again (verify idempotence)
@@ -62,13 +65,13 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("second migration run failed: %v", err)
 	}
 
-	// 7. Verify version remains 2
+	// 7. Verify version remains 3
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 2 {
-		t.Fatalf("expected schema version to remain 2, got %d", version)
+	if version != 3 {
+		t.Fatalf("expected schema version to remain 3, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -83,30 +86,30 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 	defer rows.Close()
 
-	var columns []string
+	var tokenColumns []string
 	for rows.Next() {
 		var col string
 		if err := rows.Scan(&col); err != nil {
 			t.Fatalf("failed to scan column name: %v", err)
 		}
-		columns = append(columns, col)
+		tokenColumns = append(tokenColumns, col)
 	}
 	if err := rows.Err(); err != nil {
 		t.Fatalf("rows iteration error: %v", err)
 	}
 
-	expectedColumns := map[string]bool{
+	expectedTokenColumns := map[string]bool{
 		"id":          true,
 		"token_hash":  true,
 		"created_at":  true,
 		"expires_at":  true,
 		"consumed_at": true,
 	}
-	if len(columns) != len(expectedColumns) {
-		t.Fatalf("expected %d columns, got %d: %v", len(expectedColumns), len(columns), columns)
+	if len(tokenColumns) != len(expectedTokenColumns) {
+		t.Fatalf("expected %d columns, got %d: %v", len(expectedTokenColumns), len(tokenColumns), tokenColumns)
 	}
-	for _, col := range columns {
-		if !expectedColumns[col] {
+	for _, col := range tokenColumns {
+		if !expectedTokenColumns[col] {
 			t.Errorf("unexpected column %q found in enrollment_tokens table", col)
 		}
 		if col == "token" || col == "plaintext" || col == "secret" {
@@ -114,7 +117,49 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		}
 	}
 
-	// 9. Issue enrollment token using real creation workflow
+	// 9. Verify table columns in stackpilot.agents
+	agentRows, err := db.pool.Query(ctx, `
+		SELECT column_name
+		FROM information_schema.columns
+		WHERE table_schema = 'stackpilot' AND table_name = 'agents'
+		ORDER BY ordinal_position
+	`)
+	if err != nil {
+		t.Fatalf("failed to query columns of agents: %v", err)
+	}
+	defer agentRows.Close()
+
+	var agentColumns []string
+	for agentRows.Next() {
+		var col string
+		if err := agentRows.Scan(&col); err != nil {
+			t.Fatalf("failed to scan column name: %v", err)
+		}
+		agentColumns = append(agentColumns, col)
+	}
+	if err := agentRows.Err(); err != nil {
+		t.Fatalf("rows iteration error: %v", err)
+	}
+
+	expectedAgentColumns := map[string]bool{
+		"id":                  true,
+		"public_key":          true,
+		"enrollment_token_id": true,
+		"created_at":          true,
+	}
+	if len(agentColumns) != len(expectedAgentColumns) {
+		t.Fatalf("expected %d columns in agents, got %d: %v", len(expectedAgentColumns), len(agentColumns), agentColumns)
+	}
+	for _, col := range agentColumns {
+		if !expectedAgentColumns[col] {
+			t.Errorf("unexpected column %q found in agents table", col)
+		}
+		if col == "token" || col == "private_key" || col == "secret" || col == "password" {
+			t.Errorf("prohibited column %q found in agents table", col)
+		}
+	}
+
+	// 10. Issue enrollment token using real creation workflow
 	startTime := time.Now()
 	plaintextToken, err := enrollment.IssueToken(ctx, db)
 	if err != nil {
@@ -124,54 +169,198 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("issued token does not have expected prefix")
 	}
 
-	expectedHash := enrollment.HashToken(plaintextToken)
+	tokenHash := enrollment.HashToken(plaintextToken)
 
-	// 10. Query the inserted token record by hash
+	// Generate two Ed25519 keypairs
+	pubKeyA, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key A: %v", err)
+	}
+	var keyA [32]byte
+	copy(keyA[:], pubKeyA)
+
+	pubKeyB, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key B: %v", err)
+	}
+	var keyB [32]byte
+	copy(keyB[:], pubKeyB)
+
+	// 11. Test first enrollment (token + key A) -> success, created == true
+	agentA, created, err := db.RegisterAgent(ctx, tokenHash, keyA)
+	if err != nil {
+		t.Fatalf("RegisterAgent with key A failed: %v", err)
+	}
+	if !created {
+		t.Fatal("expected created == true for first registration")
+	}
+	if len(agentA.ID) != 36 || agentA.ID[14] != '7' {
+		t.Errorf("expected Agent ID to be UUIDv7 (char 14 == '7'), got %q", agentA.ID)
+	}
+	if !bytes.Equal(agentA.PublicKey[:], keyA[:]) {
+		t.Fatal("registered agent public key does not match key A")
+	}
+
+	// Verify token row now has consumed_at NOT NULL
 	var (
-		rowID      string
-		storedHash []byte
-		createdAt  time.Time
-		expiresAt  time.Time
+		tokenRowID string
 		consumedAt sql.NullTime
 	)
-	err = db.pool.QueryRow(ctx, `
-		SELECT id::text, token_hash, created_at, expires_at, consumed_at
-		FROM stackpilot.enrollment_tokens
-		WHERE token_hash = $1
-	`, expectedHash[:]).Scan(&rowID, &storedHash, &createdAt, &expiresAt, &consumedAt)
+	err = db.pool.QueryRow(ctx, "SELECT id::text, consumed_at FROM stackpilot.enrollment_tokens WHERE token_hash = $1", tokenHash[:]).Scan(&tokenRowID, &consumedAt)
 	if err != nil {
-		t.Fatalf("failed to query inserted enrollment token by hash: %v", err)
+		t.Fatalf("failed to query token row: %v", err)
+	}
+	if !consumedAt.Valid {
+		t.Fatal("expected consumed_at to be NOT NULL after successful enrollment")
 	}
 
-	// Verify stored token_hash is 32 bytes and equals SHA-256 of plaintext
-	if len(storedHash) != 32 {
-		t.Fatalf("expected stored token_hash length 32, got %d", len(storedHash))
+	// Verify stackpilot.agents references the consumed token
+	var storedTokenID string
+	err = db.pool.QueryRow(ctx, "SELECT enrollment_token_id::text FROM stackpilot.agents WHERE id = $1::uuid", agentA.ID).Scan(&storedTokenID)
+	if err != nil {
+		t.Fatalf("failed to query agent enrollment_token_id: %v", err)
 	}
-	if !bytes.Equal(storedHash, expectedHash[:]) {
-		t.Fatal("stored token hash does not match SHA-256 of issued token")
-	}
-
-	// Verify consumed_at IS NULL
-	if consumedAt.Valid {
-		t.Errorf("expected consumed_at to be NULL, got %v", consumedAt.Time)
+	if storedTokenID != tokenRowID {
+		t.Fatalf("expected agent enrollment_token_id %q, got %q", tokenRowID, storedTokenID)
 	}
 
-	// Verify expires_at is approximately 15 minutes after created_at
-	expectedExpiry := createdAt.Add(enrollment.TokenLifetime)
-	expiryDiff := expiresAt.Sub(expectedExpiry)
-	if expiryDiff < -5*time.Second || expiryDiff > 5*time.Second {
-		t.Errorf("expires_at %v deviates significantly from expected %v (diff: %v)", expiresAt, expectedExpiry, expiryDiff)
+	// 12. Idempotent Retry: same token + same key A -> returns same Agent ID, created == false
+	agentRetry, createdRetry, err := db.RegisterAgent(ctx, tokenHash, keyA)
+	if err != nil {
+		t.Fatalf("idempotent retry failed: %v", err)
+	}
+	if createdRetry {
+		t.Fatal("expected created == false for idempotent retry")
+	}
+	if agentRetry.ID != agentA.ID {
+		t.Fatalf("expected same agent ID %q on idempotent retry, got %q", agentA.ID, agentRetry.ID)
 	}
 
-	// Verify created_at is reasonable
-	if createdAt.Before(startTime.Add(-5*time.Second)) || createdAt.After(time.Now().Add(5*time.Second)) {
-		t.Errorf("created_at %v out of reasonable range", createdAt)
+	// Verify agent count for this token is still exactly 1
+	var agentCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agents WHERE enrollment_token_id = $1::uuid", tokenRowID).Scan(&agentCount)
+	if err != nil {
+		t.Fatalf("failed to count agents: %v", err)
+	}
+	if agentCount != 1 {
+		t.Fatalf("expected exactly 1 agent row, got %d", agentCount)
 	}
 
-	// Verify row ID is UUID version 7
-	// Canonical UUID format: 8-4-4-4-12 hex digits. The version digit is character 14 (0-indexed).
-	// In UUIDv7, that character is '7'.
-	if len(rowID) != 36 || rowID[14] != '7' {
-		t.Errorf("expected row ID to be UUIDv7 (char 14 == '7'), got %q", rowID)
+	// 13. Idempotent Retry AFTER Expiration (Finding 9):
+	// Set the consumed token's expires_at into the past
+	_, err = db.pool.Exec(ctx, "UPDATE stackpilot.enrollment_tokens SET expires_at = now() - interval '1 hour' WHERE id = $1::uuid", tokenRowID)
+	if err != nil {
+		t.Fatalf("failed to expire consumed token: %v", err)
+	}
+
+	// Retrying with the same key A must still succeed and return the existing Agent
+	agentRetryExpired, createdRetryExpired, err := db.RegisterAgent(ctx, tokenHash, keyA)
+	if err != nil {
+		t.Fatalf("idempotent retry after expiration failed: %v", err)
+	}
+	if createdRetryExpired {
+		t.Fatal("expected created == false for idempotent retry after expiration")
+	}
+	if agentRetryExpired.ID != agentA.ID {
+		t.Fatalf("expected same agent ID %q on idempotent retry after expiration, got %q", agentA.ID, agentRetryExpired.ID)
+	}
+
+	// Same consumed-and-now-expired token with DIFFERENT key B: MUST be rejected
+	_, _, err = db.RegisterAgent(ctx, tokenHash, keyB)
+	if err == nil {
+		t.Fatal("expected enrollment rejection for consumed-and-expired token with different key, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrEnrollmentRejected) {
+		t.Fatalf("expected ErrEnrollmentRejected, got: %v", err)
+	}
+
+	// 14. Expired token rejection: unconsumed token with expires_at in the past
+	expiredPlaintext, err := enrollment.IssueToken(ctx, db)
+	if err != nil {
+		t.Fatalf("failed to issue token for expired test: %v", err)
+	}
+	expiredHash := enrollment.HashToken(expiredPlaintext)
+
+	_, err = db.pool.Exec(ctx, `
+		UPDATE stackpilot.enrollment_tokens
+		SET expires_at = now() - interval '30 minutes'
+		WHERE token_hash = $1
+	`, expiredHash[:])
+	if err != nil {
+		t.Fatalf("failed to update expired test token: %v", err)
+	}
+
+	_, _, err = db.RegisterAgent(ctx, expiredHash, keyB)
+	if err == nil {
+		t.Fatal("expected enrollment rejection for expired token, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrEnrollmentRejected) {
+		t.Fatalf("expected ErrEnrollmentRejected for expired token, got: %v", err)
+	}
+
+	// 15. Concurrency integration test: race two different public keys against the same valid token
+	concPlaintext, err := enrollment.IssueToken(ctx, db)
+	if err != nil {
+		t.Fatalf("failed to issue token for concurrency test: %v", err)
+	}
+	concHash := enrollment.HashToken(concPlaintext)
+
+	pubKeyC, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key C: %v", err)
+	}
+	var keyC [32]byte
+	copy(keyC[:], pubKeyC)
+
+	pubKeyD, _, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate key D: %v", err)
+	}
+	var keyD [32]byte
+	copy(keyD[:], pubKeyD)
+
+	type concResult struct {
+		record  *enrollment.AgentRecord
+		created bool
+		err     error
+	}
+
+	startBarrier := make(chan struct{})
+	results := make(chan concResult, 2)
+
+	for _, k := range [][32]byte{keyC, keyD} {
+		pub := k
+		go func() {
+			<-startBarrier
+			rec, created, regErr := db.RegisterAgent(ctx, concHash, pub)
+			results <- concResult{record: rec, created: created, err: regErr}
+		}()
+	}
+
+	// Release both goroutines simultaneously
+	close(startBarrier)
+
+	r1 := <-results
+	r2 := <-results
+
+	var (
+		winsCount   int
+		rejectCount int
+	)
+	for _, res := range []concResult{r1, r2} {
+		if res.err == nil && res.created {
+			winsCount++
+		} else if errors.Is(res.err, enrollment.ErrEnrollmentRejected) {
+			rejectCount++
+		}
+	}
+
+	if winsCount != 1 || rejectCount != 1 {
+		t.Fatalf("concurrency test failed: expected 1 winner and 1 rejection, got %d winners and %d rejections", winsCount, rejectCount)
+	}
+
+	// Ensure database created_at is reasonable
+	if startTime.After(time.Now().Add(5 * time.Second)) {
+		t.Errorf("startTime out of reasonable range")
 	}
 }

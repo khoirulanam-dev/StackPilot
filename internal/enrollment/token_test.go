@@ -178,3 +178,74 @@ func TestIssueToken_ProductionEntropy(t *testing.T) {
 		t.Error("token contains padding character '='")
 	}
 }
+
+func TestValidateToken(t *testing.T) {
+	// Valid token generated with production IssueToken
+	persister := &mockPersister{}
+	validToken, err := IssueToken(context.Background(), persister)
+	if err != nil {
+		t.Fatalf("failed to generate valid token: %v", err)
+	}
+
+	if err := ValidateToken(validToken); err != nil {
+		t.Fatalf("expected valid token to pass validation, got: %v", err)
+	}
+
+	cases := []struct {
+		name          string
+		token         string
+		expectedError string
+	}{
+		{
+			name:          "empty token",
+			token:         "",
+			expectedError: "invalid enrollment token length",
+		},
+		{
+			name:          "wrong prefix",
+			token:         "xx_enroll_" + strings.Repeat("A", 43),
+			expectedError: "invalid enrollment token prefix",
+		},
+		{
+			name:          "too short",
+			token:         "sp_enroll_" + strings.Repeat("A", 42),
+			expectedError: "invalid enrollment token length",
+		},
+		{
+			name:          "too long",
+			token:         "sp_enroll_" + strings.Repeat("A", 44),
+			expectedError: "invalid enrollment token length",
+		},
+		{
+			name:          "contains padding character",
+			token:         "sp_enroll_" + strings.Repeat("A", 42) + "=",
+			expectedError: "invalid enrollment token padding",
+		},
+		{
+			name:          "invalid base64url characters",
+			token:         "sp_enroll_" + strings.Repeat("A", 42) + "!",
+			expectedError: "invalid enrollment token encoding",
+		},
+		{
+			name:          "standard base64 with plus character",
+			token:         "sp_enroll_" + strings.Repeat("A", 42) + "+",
+			expectedError: "invalid enrollment token encoding",
+		},
+	}
+
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			err := ValidateToken(tc.token)
+			if err == nil {
+				t.Fatal("expected validation error, got nil")
+			}
+			if !strings.Contains(err.Error(), tc.expectedError) {
+				t.Fatalf("expected error containing %q, got %q", tc.expectedError, err.Error())
+			}
+			// Verify error does not leak token
+			if tc.token != "" && strings.Contains(err.Error(), tc.token) {
+				t.Fatal("validation error message leaked input token")
+			}
+		})
+	}
+}

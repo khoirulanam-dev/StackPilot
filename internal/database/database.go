@@ -1,12 +1,16 @@
 package database
 
 import (
+	"bytes"
 	"context"
+	"database/sql"
 	"errors"
 	"fmt"
 	"regexp"
 	"time"
 
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"stackpilot/internal/enrollment"
@@ -105,6 +109,126 @@ func (db *DB) CreateEnrollmentToken(ctx context.Context, tokenHash [32]byte, exp
 	}
 
 	return record, nil
+}
+
+// RegisterAgent atomically consumes an enrollment token and creates an Agent identity in a single transaction.
+// It implements safe idempotent retry for the same token + same public key.
+func (db *DB) RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*enrollment.AgentRecord, bool, error) {
+	if db.pool == nil {
+		return nil, false, fmt.Errorf("database pool is not initialized")
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to begin transaction: %w", sanitizeError(err))
+	}
+	defer func() {
+		_ = tx.Rollback(ctx)
+	}()
+
+	// 1. Query token row FOR UPDATE with database-side expiration check
+	const queryToken = `
+		SELECT id::text, (now() >= expires_at) AS is_expired, consumed_at
+		FROM stackpilot.enrollment_tokens
+		WHERE token_hash = $1
+		FOR UPDATE
+	`
+
+	var (
+		tokenID    string
+		isExpired  bool
+		consumedAt sql.NullTime
+	)
+
+	err = tx.QueryRow(ctx, queryToken, tokenHash[:]).Scan(&tokenID, &isExpired, &consumedAt)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, false, enrollment.ErrEnrollmentRejected
+		}
+		return nil, false, fmt.Errorf("failed to query enrollment token: %w", sanitizeError(err))
+	}
+
+	// 2. If already consumed: verify idempotent retry for same public key (even if token has since expired)
+	if consumedAt.Valid {
+		const queryExistingAgent = `
+			SELECT id::text, public_key, created_at
+			FROM stackpilot.agents
+			WHERE enrollment_token_id = $1::uuid
+		`
+		var (
+			existingID        string
+			existingPubKey    []byte
+			existingCreatedAt time.Time
+		)
+		err = tx.QueryRow(ctx, queryExistingAgent, tokenID).Scan(&existingID, &existingPubKey, &existingCreatedAt)
+		if err != nil {
+			return nil, false, fmt.Errorf("failed to query existing agent: %w", sanitizeError(err))
+		}
+
+		if !bytes.Equal(existingPubKey, publicKey[:]) {
+			// Consumed token with different public key: reject
+			return nil, false, enrollment.ErrEnrollmentRejected
+		}
+
+		if err := tx.Commit(ctx); err != nil {
+			return nil, false, fmt.Errorf("failed to commit transaction: %w", sanitizeError(err))
+		}
+
+		return &enrollment.AgentRecord{
+			ID:        existingID,
+			PublicKey: publicKey,
+			CreatedAt: existingCreatedAt,
+		}, false, nil
+	}
+
+	// 3. ONLY if token is still unconsumed: check expiration
+	if isExpired {
+		return nil, false, enrollment.ErrEnrollmentRejected
+	}
+
+	// 3. Not consumed: insert new agent record
+	const insertAgent = `
+		INSERT INTO stackpilot.agents (public_key, enrollment_token_id)
+		VALUES ($1, $2::uuid)
+		RETURNING id::text, created_at
+	`
+	var (
+		agentID        string
+		agentCreatedAt time.Time
+	)
+	err = tx.QueryRow(ctx, insertAgent, publicKey[:], tokenID).Scan(&agentID, &agentCreatedAt)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			// Unique violation on public_key
+			return nil, false, enrollment.ErrIdentityConflict
+		}
+		return nil, false, fmt.Errorf("failed to insert agent: %w", sanitizeError(err))
+	}
+
+	// 4. Mark token consumed
+	const consumeToken = `
+		UPDATE stackpilot.enrollment_tokens
+		SET consumed_at = now()
+		WHERE id = $1::uuid
+	`
+	tag, err := tx.Exec(ctx, consumeToken, tokenID)
+	if err != nil {
+		return nil, false, fmt.Errorf("failed to update enrollment token: %w", sanitizeError(err))
+	}
+	if tag.RowsAffected() != 1 {
+		return nil, false, fmt.Errorf("unexpected rows affected marking token consumed: %d", tag.RowsAffected())
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, false, fmt.Errorf("failed to commit transaction: %w", sanitizeError(err))
+	}
+
+	return &enrollment.AgentRecord{
+		ID:        agentID,
+		PublicKey: publicKey,
+		CreatedAt: agentCreatedAt,
+	}, true, nil
 }
 
 var (

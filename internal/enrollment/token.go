@@ -8,14 +8,37 @@ import (
 	"errors"
 	"fmt"
 	"io"
+	"strings"
 	"time"
 )
 
 const (
 	TokenPrefix       = "sp_enroll_"
 	TokenEntropyBytes = 32
+	TokenTotalLength  = len(TokenPrefix) + 43 // 53 characters
 	TokenLifetime     = 15 * time.Minute
 )
+
+var (
+	// ErrEnrollmentRejected is returned when a token is invalid, expired, or already consumed by a different key.
+	ErrEnrollmentRejected = errors.New("enrollment rejected")
+	// ErrIdentityConflict is returned when an Agent public key is already registered with another identity.
+	ErrIdentityConflict = errors.New("agent identity conflict")
+	// ErrEnrollmentInternal is returned on unexpected internal persistence failure.
+	ErrEnrollmentInternal = errors.New("internal enrollment error")
+)
+
+// AgentRecord represents safe domain metadata for an enrolled Agent.
+type AgentRecord struct {
+	ID        string
+	PublicKey [32]byte
+	CreatedAt time.Time
+}
+
+// AgentRegistrar defines the contract for atomic token consumption and Agent registration.
+type AgentRegistrar interface {
+	RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*AgentRecord, bool, error)
+}
 
 // TokenRecord represents safe metadata returned after persisting an enrollment token.
 type TokenRecord struct {
@@ -27,6 +50,29 @@ type TokenRecord struct {
 // TokenPersister defines the contract for persisting an enrollment token record.
 type TokenPersister interface {
 	CreateEnrollmentToken(ctx context.Context, tokenHash [32]byte, expiresAt time.Time) (*TokenRecord, error)
+}
+
+// ValidateToken validates that the token string matches the exact enrollment token specification.
+// It never includes the token contents in error messages.
+func ValidateToken(token string) error {
+	if len(token) != TokenTotalLength {
+		return errors.New("invalid enrollment token length")
+	}
+	if !strings.HasPrefix(token, TokenPrefix) {
+		return errors.New("invalid enrollment token prefix")
+	}
+	randomPart := strings.TrimPrefix(token, TokenPrefix)
+	if strings.Contains(randomPart, "=") {
+		return errors.New("invalid enrollment token padding")
+	}
+	raw, err := base64.RawURLEncoding.DecodeString(randomPart)
+	if err != nil {
+		return errors.New("invalid enrollment token encoding")
+	}
+	if len(raw) != TokenEntropyBytes {
+		return errors.New("invalid enrollment token entropy length")
+	}
+	return nil
 }
 
 // generatePlaintextToken generates a cryptographically random token string using the provided reader.
