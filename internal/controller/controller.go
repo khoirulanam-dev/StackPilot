@@ -35,6 +35,7 @@ type agentAuthenticator interface {
 	FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*enrollment.AgentRecord, error)
 	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error)
 	RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error
+	RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req *protocol.TelemetryRequest) error
 }
 
 func writeJSON(w http.ResponseWriter, status int, data any) {
@@ -466,6 +467,101 @@ func newRemoteHandler(logger *slog.Logger, registrar enrollmentRegistrar, authen
 				return
 			}
 			logger.Error("agent inventory database failure")
+			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+			return
+		}
+
+		w.Header().Set("Cache-Control", "no-store")
+		w.WriteHeader(http.StatusNoContent)
+	})
+
+	mux.HandleFunc(protocol.TelemetryEndpointPath, func(w http.ResponseWriter, r *http.Request) {
+		if r.TLS == nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "tls required"})
+			return
+		}
+
+		if r.Method != http.MethodPut {
+			w.Header().Set("Allow", "PUT")
+			w.WriteHeader(http.StatusMethodNotAllowed)
+			return
+		}
+
+		pubKey, err := extractAuthenticatedPeerPublicKey(r)
+		if err != nil {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
+			return
+		}
+
+		ct := r.Header.Get("Content-Type")
+		mediaType, params, err := mime.ParseMediaType(ct)
+		if err != nil || mediaType != "application/json" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid content type"})
+			return
+		}
+		if charset, ok := params["charset"]; ok && strings.ToLower(charset) != "utf-8" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unsupported charset"})
+			return
+		}
+
+		limited := io.LimitReader(r.Body, 4097)
+		bodyBytes, err := io.ReadAll(limited)
+		if err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+			return
+		}
+		if len(bodyBytes) > 4096 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+			return
+		}
+
+		if !utf8.Valid(bodyBytes) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.DisallowUnknownFields()
+		var req protocol.TelemetryRequest
+		if err := dec.Decode(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+			return
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trailing data in request body"})
+			return
+		}
+
+		if req.ProtocolVersion <= 0 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid protocol version"})
+			return
+		}
+		if req.ProtocolVersion != protocol.CurrentVersion {
+			writeJSON(w, http.StatusConflict, map[string]string{"error": "unsupported agent protocol"})
+			return
+		}
+
+		if err := protocol.ValidateTelemetryRequest(&req); err != nil {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid telemetry request"})
+			return
+		}
+
+		if authenticator == nil {
+			writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
+			return
+		}
+
+		dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+		defer cancel()
+
+		err = authenticator.RecordAgentTelemetry(dbCtx, pubKey, &req)
+		if err != nil {
+			if errors.Is(err, enrollment.ErrAgentNotFound) {
+				writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "agent authentication failed"})
+				return
+			}
+			logger.Error("agent telemetry database failure")
 			writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
 			return
 		}

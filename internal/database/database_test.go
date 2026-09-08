@@ -166,3 +166,33 @@ func TestRecordAgentInventory_Uninitialized(t *testing.T) {
 		t.Fatal("expected error on uninitialized pool, got nil")
 	}
 }
+
+func TestRecordAgentTelemetry_Uninitialized(t *testing.T) {
+	db := &DB{}
+	var key [32]byte
+	if err := db.RecordAgentTelemetry(context.Background(), key, nil); err == nil {
+		t.Fatal("expected error for nil request, got nil")
+	}
+
+	req := &protocol.TelemetryRequest{
+		ProtocolVersion:              1,
+		CPUUsageBasisPoints:          2500,
+		MemoryTotalBytes:             1000,
+		MemoryUsedBytes:              600,
+		MemoryAvailableBytes:         400,
+		Load1mMilli:                  1000,
+		Load5mMilli:                  1000,
+		Load15mMilli:                 1000,
+		RootFilesystemTotalBytes:     10000,
+		RootFilesystemUsedBytes:      4000,
+		RootFilesystemAvailableBytes: 5000,
+		NetworkReceiveBytesTotal:     200,
+		NetworkTransmitBytesTotal:    300,
+		UptimeSeconds:                120,
+		SampleWindowMS:               30000,
+	}
+	err := db.RecordAgentTelemetry(context.Background(), key, req)
+	if err == nil {
+		t.Fatal("expected error on uninitialized pool, got nil")
+	}
+}

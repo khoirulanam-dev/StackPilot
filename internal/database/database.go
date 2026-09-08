@@ -388,6 +388,96 @@ func (db *DB) RecordAgentInventory(ctx context.Context, publicKey [32]byte, req 
 	return nil
 }
 
+// RecordAgentTelemetry updates or inserts the current runtime telemetry snapshot for an Agent in one round-trip.
+func (db *DB) RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req *protocol.TelemetryRequest) error {
+	if db.pool == nil {
+		return fmt.Errorf("database pool is not initialized")
+	}
+	if req == nil {
+		return errors.New("telemetry request is nil")
+	}
+
+	const query = `
+		WITH target_agent AS (
+			SELECT id
+			FROM stackpilot.agents
+			WHERE public_key = $1
+		),
+		upserted AS (
+			INSERT INTO stackpilot.agent_telemetry (
+				agent_id,
+				cpu_usage_basis_points,
+				memory_total_bytes,
+				memory_used_bytes,
+				memory_available_bytes,
+				load_1m_milli,
+				load_5m_milli,
+				load_15m_milli,
+				root_filesystem_total_bytes,
+				root_filesystem_used_bytes,
+				root_filesystem_available_bytes,
+				network_receive_bytes_total,
+				network_transmit_bytes_total,
+				uptime_seconds,
+				sample_window_ms,
+				reported_at
+			)
+			SELECT
+				target_agent.id,
+				$2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12, $13, $14, $15,
+				now()
+			FROM target_agent
+			ON CONFLICT (agent_id)
+			DO UPDATE SET
+				cpu_usage_basis_points = EXCLUDED.cpu_usage_basis_points,
+				memory_total_bytes = EXCLUDED.memory_total_bytes,
+				memory_used_bytes = EXCLUDED.memory_used_bytes,
+				memory_available_bytes = EXCLUDED.memory_available_bytes,
+				load_1m_milli = EXCLUDED.load_1m_milli,
+				load_5m_milli = EXCLUDED.load_5m_milli,
+				load_15m_milli = EXCLUDED.load_15m_milli,
+				root_filesystem_total_bytes = EXCLUDED.root_filesystem_total_bytes,
+				root_filesystem_used_bytes = EXCLUDED.root_filesystem_used_bytes,
+				root_filesystem_available_bytes = EXCLUDED.root_filesystem_available_bytes,
+				network_receive_bytes_total = EXCLUDED.network_receive_bytes_total,
+				network_transmit_bytes_total = EXCLUDED.network_transmit_bytes_total,
+				uptime_seconds = EXCLUDED.uptime_seconds,
+				sample_window_ms = EXCLUDED.sample_window_ms,
+				reported_at = now()
+			RETURNING agent_id
+		)
+		SELECT agent_id
+		FROM upserted;
+	`
+
+	var agentID string
+	err := db.pool.QueryRow(ctx, query,
+		publicKey[:],
+		req.CPUUsageBasisPoints,
+		req.MemoryTotalBytes,
+		req.MemoryUsedBytes,
+		req.MemoryAvailableBytes,
+		req.Load1mMilli,
+		req.Load5mMilli,
+		req.Load15mMilli,
+		req.RootFilesystemTotalBytes,
+		req.RootFilesystemUsedBytes,
+		req.RootFilesystemAvailableBytes,
+		req.NetworkReceiveBytesTotal,
+		req.NetworkTransmitBytesTotal,
+		req.UptimeSeconds,
+		req.SampleWindowMS,
+	).Scan(&agentID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return enrollment.ErrAgentNotFound
+		}
+		return fmt.Errorf("failed to record agent telemetry: %w", sanitizeError(err))
+	}
+
+	return nil
+}
+
 var (
 	passwordPattern = regexp.MustCompile(`(?i)(password=)[^\s&,]+`)
 	userinfoPattern = regexp.MustCompile(`(:)[^/@:]+(@)`)

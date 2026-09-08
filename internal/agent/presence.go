@@ -32,7 +32,7 @@ var (
 	ErrAuthRejected = errors.New("agent authentication rejected by controller")
 	// ErrProtocolMismatch is returned when controller rejects agent protocol version (HTTP 409).
 	ErrProtocolMismatch = errors.New("controller rejected agent protocol version")
-	// ErrPermanentFailure marks unrecoverable heartbeat errors.
+	// ErrPermanentFailure marks unrecoverable agent loop errors.
 	ErrPermanentFailure = errors.New("permanent heartbeat error")
 )
 
@@ -146,6 +146,7 @@ type presenceConfig struct {
 	inventoryInterval      time.Duration
 	inventoryRetryInterval time.Duration
 	collector              func() (*protocol.InventoryRequest, error)
+	sampler                telemetrySampler
 }
 
 func defaultPresenceConfig() presenceConfig {
@@ -161,6 +162,7 @@ func defaultPresenceConfig() presenceConfig {
 		inventoryInterval:      DefaultInventoryInterval,
 		inventoryRetryInterval: DefaultInventoryRetryInterval,
 		collector:              collectLinuxInventory,
+		sampler:                newTelemetrySampler(),
 	}
 }
 
@@ -258,12 +260,19 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 
 	heartbeatURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.HeartbeatEndpointPath}).String()
 	inventoryURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.InventoryEndpointPath}).String()
+	telemetryURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.TelemetryEndpointPath}).String()
+
+	sampler := cfg.sampler
+	if sampler == nil {
+		sampler = &noopTelemetrySampler{}
+	}
 
 	consecutiveFailures := 0
 	loggedFailure := false
 
 	var nextInventoryAt time.Time
 	inventoryFailureLogged := false
+	telemetryFailureLogged := false
 
 	for {
 		if ctx.Err() != nil {
@@ -316,8 +325,8 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 			}
 			consecutiveFailures = 0
 
-			now := cfg.nowFunc()
-			if nextInventoryAt.IsZero() || !now.Before(nextInventoryAt) {
+			inventoryNow := cfg.nowFunc()
+			if nextInventoryAt.IsZero() || !inventoryNow.Before(nextInventoryAt) {
 				var invReport *protocol.InventoryRequest
 				var collectErr error
 				if cfg.collector != nil {
@@ -340,7 +349,7 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 					if cfg.jitterFunc != nil {
 						retryDur = cfg.jitterFunc(retryDur, 0.10)
 					}
-					nextInventoryAt = now.Add(retryDur)
+					nextInventoryAt = inventoryNow.Add(retryDur)
 				} else {
 					invErr := sendInventory(ctx, client, inventoryURL, invReport)
 					if invErr != nil {
@@ -367,7 +376,7 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 						if cfg.jitterFunc != nil {
 							retryDur = cfg.jitterFunc(retryDur, 0.10)
 						}
-						nextInventoryAt = now.Add(retryDur)
+						nextInventoryAt = inventoryNow.Add(retryDur)
 					} else {
 						if inventoryFailureLogged {
 							if logger != nil {
@@ -382,7 +391,45 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 						if cfg.jitterFunc != nil {
 							interval = cfg.jitterFunc(interval, 0.10)
 						}
-						nextInventoryAt = now.Add(interval)
+						nextInventoryAt = inventoryNow.Add(interval)
+					}
+				}
+			}
+
+			telemetryNow := cfg.nowFunc()
+			telemReport, ready, telemErr := sampler.Sample(telemetryNow)
+			if telemErr != nil {
+				if !telemetryFailureLogged {
+					if logger != nil {
+						logger.Warn("agent telemetry collection failed; will retry", "error", telemErr)
+					}
+					telemetryFailureLogged = true
+				}
+			} else if ready && telemReport != nil {
+				sendErr := sendTelemetry(ctx, client, telemetryURL, telemReport)
+				if sendErr != nil {
+					if ctx.Err() != nil {
+						return nil
+					}
+					if IsPermanentError(sendErr) {
+						if logger != nil {
+							logger.Error("permanent telemetry failure; stopping daemon", "error", sendErr)
+						}
+						return sendErr
+					}
+
+					if !telemetryFailureLogged {
+						if logger != nil {
+							logger.Warn("agent telemetry delivery failed; will retry", "error", sendErr)
+						}
+						telemetryFailureLogged = true
+					}
+				} else {
+					if telemetryFailureLogged {
+						if logger != nil {
+							logger.Info("agent telemetry recovered", "agent_id", meta.AgentID)
+						}
+						telemetryFailureLogged = false
 					}
 				}
 			}

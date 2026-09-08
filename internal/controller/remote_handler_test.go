@@ -43,6 +43,9 @@ type fakeAuthBackend struct {
 	inventoryErr        error
 	lastInventoryKey    [32]byte
 	lastInventoryReq    *protocol.InventoryRequest
+	telemetryErr        error
+	lastTelemetryKey    [32]byte
+	lastTelemetryReq    *protocol.TelemetryRequest
 }
 
 func (f *fakeAuthBackend) RegisterAgent(ctx context.Context, tokenHash [32]byte, publicKey [32]byte) (*enrollment.AgentRecord, bool, error) {
@@ -117,6 +120,24 @@ func (f *fakeAuthBackend) RecordAgentInventory(ctx context.Context, publicKey [3
 		if _, ok := f.agents[publicKey]; ok {
 			f.lastInventoryKey = publicKey
 			f.lastInventoryReq = req
+			return nil
+		}
+	}
+	return enrollment.ErrAgentNotFound
+}
+
+func (f *fakeAuthBackend) RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req *protocol.TelemetryRequest) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+
+	if f.telemetryErr != nil {
+		return f.telemetryErr
+	}
+
+	if f.agents != nil {
+		if _, ok := f.agents[publicKey]; ok {
+			f.lastTelemetryKey = publicKey
+			f.lastTelemetryReq = req
 			return nil
 		}
 	}
@@ -1696,5 +1717,576 @@ func TestRealTLSInventory_E2E(t *testing.T) {
 	}
 	if backend.lastInventoryReq.MemoryTotalBytes != invReq.MemoryTotalBytes {
 		t.Errorf("memory_total_bytes mismatch: got %d, want %d", backend.lastInventoryReq.MemoryTotalBytes, invReq.MemoryTotalBytes)
+	}
+}
+
+func TestRemoteHandler_AgentTelemetry(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+
+	pubA, _, certA := helperGenerateEd25519Cert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "AgentA", nil)
+	pubB, _, certB := helperGenerateEd25519Cert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "AgentA", []string{"AgentA"})
+	_, _, expiredCert := helperGenerateEd25519Cert(t, time.Now().Add(-2*time.Hour), time.Now().Add(-time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "AgentExpired", nil)
+	_, _, futureCert := helperGenerateEd25519Cert(t, time.Now().Add(time.Hour), time.Now().Add(2*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "AgentFuture", nil)
+	_, _, wrongEKUCert := helperGenerateEd25519Cert(t, time.Now().Add(-time.Hour), time.Now().Add(time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth}, "AgentServerOnly", nil)
+	_, ecdsaCert := helperGenerateECDSACert(t)
+
+	var keyA [32]byte
+	copy(keyA[:], pubA)
+
+	var keyB [32]byte
+	copy(keyB[:], pubB)
+
+	backend := &fakeAuthBackend{
+		agents: map[[32]byte]*enrollment.AgentRecord{
+			keyA: {
+				ID:        "018f0000-0000-7000-8000-000000000001",
+				PublicKey: keyA,
+				CreatedAt: time.Now().UTC(),
+			},
+		},
+	}
+
+	handler := newRemoteHandler(logger, backend, backend)
+
+	validReq := protocol.TelemetryRequest{
+		ProtocolVersion:              protocol.CurrentVersion,
+		CPUUsageBasisPoints:          2500,
+		MemoryTotalBytes:             16777216000,
+		MemoryUsedBytes:              8388608000,
+		MemoryAvailableBytes:         8388608000,
+		Load1mMilli:                  1250,
+		Load5mMilli:                  950,
+		Load15mMilli:                 600,
+		RootFilesystemTotalBytes:     107374182400,
+		RootFilesystemUsedBytes:      42949672960,
+		RootFilesystemAvailableBytes: 64424509440,
+		NetworkReceiveBytesTotal:     10485760,
+		NetworkTransmitBytesTotal:    5242880,
+		UptimeSeconds:                3600,
+		SampleWindowMS:               30000,
+	}
+	validBodyBytes, _ := json.Marshal(validReq)
+	validBody := string(validBodyBytes)
+
+	t.Run("plaintext_put_telemetry_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for plaintext telemetry, got %d", rec.Code)
+		}
+	})
+
+	for _, method := range []string{http.MethodGet, http.MethodPost, http.MethodDelete} {
+		t.Run("method_not_allowed_"+method, func(t *testing.T) {
+			req := httptest.NewRequest(method, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+			req.TLS = &tls.ConnectionState{
+				PeerCertificates: []*x509.Certificate{certA},
+			}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusMethodNotAllowed {
+				t.Fatalf("expected 405 Method Not Allowed, got %d", rec.Code)
+			}
+			if allow := rec.Header().Get("Allow"); allow != "PUT" {
+				t.Errorf("expected Allow: PUT header, got %q", allow)
+			}
+		})
+	}
+
+	t.Run("missing_client_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: nil}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 Unauthorized, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unknown_public_key_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certB}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for unknown enrolled agent key, got %d", rec.Code)
+		}
+	})
+
+	t.Run("wrong_key_type_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{ecdsaCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for ECDSA key, got %d", rec.Code)
+		}
+	})
+
+	t.Run("expired_client_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{expiredCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for expired cert, got %d", rec.Code)
+		}
+	})
+
+	t.Run("future_client_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{futureCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for future cert, got %d", rec.Code)
+		}
+	})
+
+	t.Run("wrong_eku_cert_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{wrongEKUCert}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 for wrong EKU, got %d", rec.Code)
+		}
+	})
+
+	t.Run("text_impersonation_rejected_by_public_key", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certB}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusUnauthorized {
+			t.Fatalf("expected 401 when key B attempts to impersonate Agent A, got %d", rec.Code)
+		}
+	})
+
+	t.Run("invalid_content_type", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "text/plain")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for text/plain, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unsupported_charset", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json; charset=iso-8859-1")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for non-utf8 charset, got %d", rec.Code)
+		}
+	})
+
+	t.Run("oversized_body_rejected", func(t *testing.T) {
+		largeBody := `{"protocol_version": 1, "cpu_usage_basis_points": 0, "padding": "` + strings.Repeat("a", 4096) + `"}`
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(largeBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for oversized body, got %d", rec.Code)
+		}
+	})
+
+	t.Run("raw_invalid_utf8_rejected", func(t *testing.T) {
+		rawInvalidUTF8 := []byte(`{"protocol_version": 1, "invalid": "` + "\xff\xfe\xfd" + `"}`)
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(rawInvalidUTF8))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for raw invalid UTF-8 body, got %d", rec.Code)
+		}
+	})
+
+	t.Run("malformed_json_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(`{"protocol_version":`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for malformed json, got %d", rec.Code)
+		}
+	})
+
+	t.Run("unknown_json_field_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra_field": "disallowed"}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for unknown json field, got %d", rec.Code)
+		}
+	})
+
+	t.Run("trailing_json_rejected", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody+`{"extra": 1}`))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for trailing json, got %d", rec.Code)
+		}
+	})
+
+	t.Run("protocol_version_zero_rejected", func(t *testing.T) {
+		badReq := validReq
+		badReq.ProtocolVersion = 0
+		badBytes, _ := json.Marshal(badReq)
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(badBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusBadRequest {
+			t.Fatalf("expected 400 for protocol_version 0, got %d", rec.Code)
+		}
+	})
+
+	t.Run("protocol_version_mismatch_conflict", func(t *testing.T) {
+		badReq := validReq
+		badReq.ProtocolVersion = 2
+		badBytes, _ := json.Marshal(badReq)
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(badBytes))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusConflict {
+			t.Fatalf("expected 409 for protocol_version 2, got %d", rec.Code)
+		}
+	})
+
+	metricBoundaries := []struct {
+		name   string
+		mutate func(r *protocol.TelemetryRequest)
+	}{
+		{"negative_cpu", func(r *protocol.TelemetryRequest) { r.CPUUsageBasisPoints = -1 }},
+		{"cpu_10001", func(r *protocol.TelemetryRequest) { r.CPUUsageBasisPoints = 10001 }},
+		{"memory_total_zero", func(r *protocol.TelemetryRequest) { r.MemoryTotalBytes = 0 }},
+		{"memory_avail_negative", func(r *protocol.TelemetryRequest) { r.MemoryAvailableBytes = -1 }},
+		{"memory_used_inconsistent", func(r *protocol.TelemetryRequest) { r.MemoryUsedBytes = 1 }},
+		{"load1_negative", func(r *protocol.TelemetryRequest) { r.Load1mMilli = -1 }},
+		{"load5_negative", func(r *protocol.TelemetryRequest) { r.Load5mMilli = -1 }},
+		{"load15_negative", func(r *protocol.TelemetryRequest) { r.Load15mMilli = -1 }},
+		{"fs_total_zero", func(r *protocol.TelemetryRequest) { r.RootFilesystemTotalBytes = 0 }},
+		{"fs_used_exceeds_total", func(r *protocol.TelemetryRequest) { r.RootFilesystemUsedBytes = r.RootFilesystemTotalBytes + 1 }},
+		{"fs_avail_exceeds_free", func(r *protocol.TelemetryRequest) { r.RootFilesystemAvailableBytes = r.RootFilesystemTotalBytes + 1 }},
+		{"net_rx_negative", func(r *protocol.TelemetryRequest) { r.NetworkReceiveBytesTotal = -1 }},
+		{"net_tx_negative", func(r *protocol.TelemetryRequest) { r.NetworkTransmitBytesTotal = -1 }},
+		{"uptime_negative", func(r *protocol.TelemetryRequest) { r.UptimeSeconds = -1 }},
+		{"window_zero", func(r *protocol.TelemetryRequest) { r.SampleWindowMS = 0 }},
+		{"window_300001", func(r *protocol.TelemetryRequest) { r.SampleWindowMS = 300001 }},
+	}
+
+	for _, tc := range metricBoundaries {
+		t.Run("boundary_"+tc.name, func(t *testing.T) {
+			rCopy := validReq
+			tc.mutate(&rCopy)
+			data, _ := json.Marshal(rCopy)
+			req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(data))
+			req.Header.Set("Content-Type", "application/json")
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+			rec := httptest.NewRecorder()
+			handler.ServeHTTP(rec, req)
+
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 for %s, got %d", tc.name, rec.Code)
+			}
+		})
+	}
+
+	t.Run("database_failure_returns_generic_500", func(t *testing.T) {
+		backend.telemetryErr = errors.New("simulated database failure with secret postgres://user:pass@host/db")
+		defer func() { backend.telemetryErr = nil }()
+
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusInternalServerError {
+			t.Fatalf("expected 500 for database failure, got %d", rec.Code)
+		}
+		if strings.Contains(rec.Body.String(), "postgres://") {
+			t.Fatalf("database failure leaked secrets in response: %s", rec.Body.String())
+		}
+	})
+
+	t.Run("valid_telemetry_returns_204_and_no_cors", func(t *testing.T) {
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(validBody))
+		req.Header.Set("Content-Type", "application/json")
+		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
+		rec := httptest.NewRecorder()
+		handler.ServeHTTP(rec, req)
+
+		if rec.Code != http.StatusNoContent {
+			t.Fatalf("expected 204 No Content, got %d. Body: %s", rec.Code, rec.Body.String())
+		}
+		if rec.Body.Len() != 0 {
+			t.Fatalf("expected empty response body, got %d bytes", rec.Body.Len())
+		}
+		if cc := rec.Header().Get("Cache-Control"); cc != "no-store" {
+			t.Errorf("expected Cache-Control: no-store, got %q", cc)
+		}
+		if cors := rec.Header().Get("Access-Control-Allow-Origin"); cors != "" {
+			t.Errorf("unexpected CORS header found: %q", cors)
+		}
+
+		if backend.lastTelemetryKey != keyA {
+			t.Fatalf("expected backend to receive keyA, got %x", backend.lastTelemetryKey)
+		}
+		if backend.lastTelemetryReq == nil || backend.lastTelemetryReq.CPUUsageBasisPoints != validReq.CPUUsageBasisPoints {
+			t.Fatal("backend telemetry request not recorded correctly")
+		}
+	})
+}
+
+func TestRealTLSTelemetry_E2E(t *testing.T) {
+	caPub, caPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate CA key: %v", err)
+	}
+	caTemplate := &x509.Certificate{
+		SerialNumber:          big.NewInt(700),
+		Subject:               pkix.Name{CommonName: "StackPilot Real TLS Telemetry CA"},
+		NotBefore:             time.Now().Add(-1 * time.Hour),
+		NotAfter:              time.Now().Add(24 * time.Hour),
+		IsCA:                  true,
+		KeyUsage:              x509.KeyUsageCertSign,
+		BasicConstraintsValid: true,
+	}
+	caDER, err := x509.CreateCertificate(rand.Reader, caTemplate, caTemplate, caPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create CA cert: %v", err)
+	}
+	caCert, _ := x509.ParseCertificate(caDER)
+	caPEM := pem.EncodeToMemory(&pem.Block{Type: "CERTIFICATE", Bytes: caDER})
+
+	srvPub, srvPriv, err := ed25519.GenerateKey(rand.Reader)
+	if err != nil {
+		t.Fatalf("failed to generate srv key: %v", err)
+	}
+	srvTemplate := &x509.Certificate{
+		SerialNumber: big.NewInt(701),
+		Subject:      pkix.Name{CommonName: "127.0.0.1"},
+		IPAddresses:  []net.IP{net.ParseIP("127.0.0.1")},
+		NotBefore:    time.Now().Add(-1 * time.Hour),
+		NotAfter:     time.Now().Add(24 * time.Hour),
+		KeyUsage:     x509.KeyUsageDigitalSignature,
+		ExtKeyUsage:  []x509.ExtKeyUsage{x509.ExtKeyUsageServerAuth},
+	}
+	srvDER, err := x509.CreateCertificate(rand.Reader, srvTemplate, caCert, srvPub, caPriv)
+	if err != nil {
+		t.Fatalf("failed to create srv cert: %v", err)
+	}
+	srvTLSCert := tls.Certificate{
+		Certificate: [][]byte{srvDER},
+		PrivateKey:  srvPriv,
+	}
+
+	backend := &fakeAuthBackend{}
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	remoteHandler := newRemoteHandler(logger, backend, backend)
+
+	ts := httptest.NewUnstartedServer(remoteHandler)
+	ts.TLS = &tls.Config{
+		MinVersion:   tls.VersionTLS13,
+		Certificates: []tls.Certificate{srvTLSCert},
+		ClientAuth:   tls.RequestClientCert,
+	}
+	ts.StartTLS()
+	defer ts.Close()
+
+	tempDir := t.TempDir()
+	stateDir := filepath.Join(tempDir, "state")
+	if err := agent.EnsureStateDir(stateDir); err != nil {
+		t.Fatalf("EnsureStateDir failed: %v", err)
+	}
+
+	pub, priv, err := agent.LoadOrGenerateKey(stateDir, rand.Reader)
+	if err != nil {
+		t.Fatalf("LoadOrGenerateKey failed: %v", err)
+	}
+
+	var key32 [32]byte
+	copy(key32[:], pub)
+
+	const agentID = "018f0000-0000-7000-8000-000000000088"
+	backend.agents = map[[32]byte]*enrollment.AgentRecord{
+		key32: {
+			ID:        agentID,
+			PublicKey: key32,
+			CreatedAt: time.Now().UTC(),
+		},
+	}
+
+	meta := &agent.IdentityMetadata{
+		Version:       1,
+		AgentID:       agentID,
+		ControllerURL: ts.URL,
+		PublicKey:     agent.FormatPublicKeyBase64RawURL(pub),
+	}
+	if err := agent.WriteIdentityMetadata(stateDir, meta); err != nil {
+		t.Fatalf("WriteIdentityMetadata failed: %v", err)
+	}
+
+	caPath := filepath.Join(tempDir, "controller-ca.pem")
+	if err := os.WriteFile(caPath, caPEM, 0644); err != nil {
+		t.Fatalf("failed to write CA file: %v", err)
+	}
+	if err := agent.ValidateAndPersistCAFile(stateDir, caPath); err != nil {
+		t.Fatalf("ValidateAndPersistCAFile failed: %v", err)
+	}
+
+	clientCert, err := agent.BuildEphemeralClientCert(priv)
+	if err != nil {
+		t.Fatalf("BuildEphemeralClientCert failed: %v", err)
+	}
+
+	rootCAs, err := agent.LoadControllerTrustRoots(stateDir)
+	if err != nil {
+		t.Fatalf("LoadControllerTrustRoots failed: %v", err)
+	}
+
+	client := agent.BuildAgentHTTPClient(rootCAs, &clientCert)
+
+	telemURL := ts.URL + protocol.TelemetryEndpointPath
+	telemReq := protocol.TelemetryRequest{
+		ProtocolVersion:              protocol.CurrentVersion,
+		CPUUsageBasisPoints:          4200,
+		MemoryTotalBytes:             16000000000,
+		MemoryUsedBytes:              10000000000,
+		MemoryAvailableBytes:         6000000000,
+		Load1mMilli:                  2500,
+		Load5mMilli:                  1800,
+		Load15mMilli:                 1200,
+		RootFilesystemTotalBytes:     100000000000,
+		RootFilesystemUsedBytes:      50000000000,
+		RootFilesystemAvailableBytes: 50000000000,
+		NetworkReceiveBytesTotal:     20000000,
+		NetworkTransmitBytesTotal:    10000000,
+		UptimeSeconds:                86400,
+		SampleWindowMS:               30000,
+	}
+	payload, err := json.Marshal(telemReq)
+	if err != nil {
+		t.Fatalf("failed to marshal telemetry request: %v", err)
+	}
+
+	req, err := http.NewRequestWithContext(context.Background(), http.MethodPut, telemURL, bytes.NewReader(payload))
+	if err != nil {
+		t.Fatalf("failed to construct HTTP request: %v", err)
+	}
+	req.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(req)
+	if err != nil {
+		t.Fatalf("real TLS telemetry request failed: %v", err)
+	}
+	defer resp.Body.Close()
+
+	if resp.StatusCode != http.StatusNoContent {
+		t.Fatalf("expected 204 No Content, got %d", resp.StatusCode)
+	}
+
+	if resp.TLS == nil {
+		t.Fatal("expected non-nil resp.TLS")
+	}
+	if resp.TLS.Version != tls.VersionTLS13 {
+		t.Fatalf("expected TLS 1.3 (0x%04x), got 0x%04x", tls.VersionTLS13, resp.TLS.Version)
+	}
+
+	if backend.lastTelemetryKey != key32 {
+		t.Errorf("backend received key mismatch: got %x, want %x", backend.lastTelemetryKey, key32)
+	}
+	if backend.lastTelemetryReq == nil {
+		t.Fatal("backend lastTelemetryReq is nil")
+	}
+	if backend.lastTelemetryReq.ProtocolVersion != telemReq.ProtocolVersion {
+		t.Errorf("protocol version mismatch: got %d, want %d", backend.lastTelemetryReq.ProtocolVersion, telemReq.ProtocolVersion)
+	}
+	if backend.lastTelemetryReq.CPUUsageBasisPoints != telemReq.CPUUsageBasisPoints {
+		t.Errorf("cpu mismatch: got %d, want %d", backend.lastTelemetryReq.CPUUsageBasisPoints, telemReq.CPUUsageBasisPoints)
+	}
+	if backend.lastTelemetryReq.MemoryTotalBytes != telemReq.MemoryTotalBytes {
+		t.Errorf("memory_total_bytes mismatch: got %d, want %d", backend.lastTelemetryReq.MemoryTotalBytes, telemReq.MemoryTotalBytes)
+	}
+	if backend.lastTelemetryReq.MemoryUsedBytes != telemReq.MemoryUsedBytes {
+		t.Errorf("memory_used_bytes mismatch: got %d, want %d", backend.lastTelemetryReq.MemoryUsedBytes, telemReq.MemoryUsedBytes)
+	}
+	if backend.lastTelemetryReq.MemoryAvailableBytes != telemReq.MemoryAvailableBytes {
+		t.Errorf("memory_available_bytes mismatch: got %d, want %d", backend.lastTelemetryReq.MemoryAvailableBytes, telemReq.MemoryAvailableBytes)
+	}
+	if backend.lastTelemetryReq.Load1mMilli != telemReq.Load1mMilli {
+		t.Errorf("load1 mismatch: got %d, want %d", backend.lastTelemetryReq.Load1mMilli, telemReq.Load1mMilli)
+	}
+	if backend.lastTelemetryReq.Load5mMilli != telemReq.Load5mMilli {
+		t.Errorf("load5 mismatch: got %d, want %d", backend.lastTelemetryReq.Load5mMilli, telemReq.Load5mMilli)
+	}
+	if backend.lastTelemetryReq.Load15mMilli != telemReq.Load15mMilli {
+		t.Errorf("load15 mismatch: got %d, want %d", backend.lastTelemetryReq.Load15mMilli, telemReq.Load15mMilli)
+	}
+	if backend.lastTelemetryReq.RootFilesystemTotalBytes != telemReq.RootFilesystemTotalBytes {
+		t.Errorf("fs_total mismatch: got %d, want %d", backend.lastTelemetryReq.RootFilesystemTotalBytes, telemReq.RootFilesystemTotalBytes)
+	}
+	if backend.lastTelemetryReq.RootFilesystemUsedBytes != telemReq.RootFilesystemUsedBytes {
+		t.Errorf("fs_used mismatch: got %d, want %d", backend.lastTelemetryReq.RootFilesystemUsedBytes, telemReq.RootFilesystemUsedBytes)
+	}
+	if backend.lastTelemetryReq.RootFilesystemAvailableBytes != telemReq.RootFilesystemAvailableBytes {
+		t.Errorf("fs_avail mismatch: got %d, want %d", backend.lastTelemetryReq.RootFilesystemAvailableBytes, telemReq.RootFilesystemAvailableBytes)
+	}
+	if backend.lastTelemetryReq.NetworkReceiveBytesTotal != telemReq.NetworkReceiveBytesTotal {
+		t.Errorf("net_rx mismatch: got %d, want %d", backend.lastTelemetryReq.NetworkReceiveBytesTotal, telemReq.NetworkReceiveBytesTotal)
+	}
+	if backend.lastTelemetryReq.NetworkTransmitBytesTotal != telemReq.NetworkTransmitBytesTotal {
+		t.Errorf("net_tx mismatch: got %d, want %d", backend.lastTelemetryReq.NetworkTransmitBytesTotal, telemReq.NetworkTransmitBytesTotal)
+	}
+	if backend.lastTelemetryReq.UptimeSeconds != telemReq.UptimeSeconds {
+		t.Errorf("uptime mismatch: got %d, want %d", backend.lastTelemetryReq.UptimeSeconds, telemReq.UptimeSeconds)
+	}
+	if backend.lastTelemetryReq.SampleWindowMS != telemReq.SampleWindowMS {
+		t.Errorf("sample_window_ms mismatch: got %d, want %d", backend.lastTelemetryReq.SampleWindowMS, telemReq.SampleWindowMS)
 	}
 }

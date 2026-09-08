@@ -51,28 +51,29 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 5 (migrations 001, 002, 003, 004, 005 applied)
+	// 5. Verify migration version is 6 (migrations 001-006 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("expected schema version 5, got %d", version)
+	if version != 6 {
+		t.Fatalf("expected schema version 6, got %d", version)
 	}
 
-	// 6. Run migration again (verify idempotence)
-	if err := db.Migrate(ctx, nil); err != nil {
-		t.Fatalf("second migration run failed: %v", err)
+	// 6. Run db.Migrate() a second time (idempotency check)
+	err = db.Migrate(ctx, nil)
+	if err != nil {
+		t.Fatalf("second db.Migrate() failed: %v", err)
 	}
 
-	// 7. Verify version remains 5
+	// 7. Verify version remains 6
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 5 {
-		t.Fatalf("expected schema version to remain 5, got %d", version)
+	if version != 6 {
+		t.Fatalf("expected schema version to remain 6, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -682,6 +683,286 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 	if countAfterUnknown != 1 {
 		t.Fatalf("expected agent inventory row count to remain 1 after unknown attempt, got %d", countAfterUnknown)
+	}
+
+	var initialTelemetryCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_telemetry WHERE agent_id = $1::uuid", agentH.ID).Scan(&initialTelemetryCount)
+	if err != nil {
+		t.Fatalf("failed to query initial agent_telemetry count: %v", err)
+	}
+	if initialTelemetryCount != 0 {
+		t.Fatalf("expected 0 telemetry rows before first submission, got %d", initialTelemetryCount)
+	}
+
+	telemReq1 := &protocol.TelemetryRequest{
+		ProtocolVersion:              1,
+		CPUUsageBasisPoints:          2500,
+		MemoryTotalBytes:             16777216000,
+		MemoryUsedBytes:              8388608000,
+		MemoryAvailableBytes:         8388608000,
+		Load1mMilli:                  1250,
+		Load5mMilli:                  950,
+		Load15mMilli:                 600,
+		RootFilesystemTotalBytes:     107374182400,
+		RootFilesystemUsedBytes:      42949672960,
+		RootFilesystemAvailableBytes: 64424509440,
+		NetworkReceiveBytesTotal:     10485760,
+		NetworkTransmitBytesTotal:    5242880,
+		UptimeSeconds:                3600,
+		SampleWindowMS:               30000,
+	}
+
+	err = db.RecordAgentTelemetry(ctx, keyH, telemReq1)
+	if err != nil {
+		t.Fatalf("RecordAgentTelemetry failed on first insert: %v", err)
+	}
+
+	var (
+		scannedTelemAgentID  string
+		scannedCPU           int
+		scannedMemTotal      int64
+		scannedMemUsed       int64
+		scannedMemAvail      int64
+		scannedLoad1         int64
+		scannedLoad5         int64
+		scannedLoad15        int64
+		scannedFSTotal       int64
+		scannedFSUsed        int64
+		scannedFSAvail       int64
+		scannedNetRX         int64
+		scannedNetTX         int64
+		scannedUptime        int64
+		scannedWindow        int64
+		firstTelemReportedAt time.Time
+	)
+	err = db.pool.QueryRow(ctx, `
+		SELECT agent_id, cpu_usage_basis_points, memory_total_bytes, memory_used_bytes, memory_available_bytes,
+		       load_1m_milli, load_5m_milli, load_15m_milli,
+		       root_filesystem_total_bytes, root_filesystem_used_bytes, root_filesystem_available_bytes,
+		       network_receive_bytes_total, network_transmit_bytes_total,
+		       uptime_seconds, sample_window_ms, reported_at
+		FROM stackpilot.agent_telemetry
+		WHERE agent_id = $1::uuid
+	`, agentH.ID).Scan(
+		&scannedTelemAgentID,
+		&scannedCPU,
+		&scannedMemTotal,
+		&scannedMemUsed,
+		&scannedMemAvail,
+		&scannedLoad1,
+		&scannedLoad5,
+		&scannedLoad15,
+		&scannedFSTotal,
+		&scannedFSUsed,
+		&scannedFSAvail,
+		&scannedNetRX,
+		&scannedNetTX,
+		&scannedUptime,
+		&scannedWindow,
+		&firstTelemReportedAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to query agent_telemetry: %v", err)
+	}
+	if scannedTelemAgentID != agentH.ID {
+		t.Fatalf("expected agent_id %q, got %q", agentH.ID, scannedTelemAgentID)
+	}
+	if scannedCPU != telemReq1.CPUUsageBasisPoints {
+		t.Fatalf("expected cpu %d, got %d", telemReq1.CPUUsageBasisPoints, scannedCPU)
+	}
+	if scannedMemTotal != telemReq1.MemoryTotalBytes {
+		t.Fatalf("expected memory_total %d, got %d", telemReq1.MemoryTotalBytes, scannedMemTotal)
+	}
+	if scannedMemUsed != telemReq1.MemoryUsedBytes {
+		t.Fatalf("expected memory_used %d, got %d", telemReq1.MemoryUsedBytes, scannedMemUsed)
+	}
+	if scannedMemAvail != telemReq1.MemoryAvailableBytes {
+		t.Fatalf("expected memory_available %d, got %d", telemReq1.MemoryAvailableBytes, scannedMemAvail)
+	}
+	if scannedLoad1 != telemReq1.Load1mMilli {
+		t.Fatalf("expected load1 %d, got %d", telemReq1.Load1mMilli, scannedLoad1)
+	}
+	if scannedLoad5 != telemReq1.Load5mMilli {
+		t.Fatalf("expected load5 %d, got %d", telemReq1.Load5mMilli, scannedLoad5)
+	}
+	if scannedLoad15 != telemReq1.Load15mMilli {
+		t.Fatalf("expected load15 %d, got %d", telemReq1.Load15mMilli, scannedLoad15)
+	}
+	if scannedFSTotal != telemReq1.RootFilesystemTotalBytes {
+		t.Fatalf("expected fs_total %d, got %d", telemReq1.RootFilesystemTotalBytes, scannedFSTotal)
+	}
+	if scannedFSUsed != telemReq1.RootFilesystemUsedBytes {
+		t.Fatalf("expected fs_used %d, got %d", telemReq1.RootFilesystemUsedBytes, scannedFSUsed)
+	}
+	if scannedFSAvail != telemReq1.RootFilesystemAvailableBytes {
+		t.Fatalf("expected fs_available %d, got %d", telemReq1.RootFilesystemAvailableBytes, scannedFSAvail)
+	}
+	if scannedNetRX != telemReq1.NetworkReceiveBytesTotal {
+		t.Fatalf("expected net_rx %d, got %d", telemReq1.NetworkReceiveBytesTotal, scannedNetRX)
+	}
+	if scannedNetTX != telemReq1.NetworkTransmitBytesTotal {
+		t.Fatalf("expected net_tx %d, got %d", telemReq1.NetworkTransmitBytesTotal, scannedNetTX)
+	}
+	if scannedUptime != telemReq1.UptimeSeconds {
+		t.Fatalf("expected uptime %d, got %d", telemReq1.UptimeSeconds, scannedUptime)
+	}
+	if scannedWindow != telemReq1.SampleWindowMS {
+		t.Fatalf("expected sample_window_ms %d, got %d", telemReq1.SampleWindowMS, scannedWindow)
+	}
+	if firstTelemReportedAt.IsZero() {
+		t.Fatal("expected non-zero reported_at")
+	}
+
+	telemReq2 := &protocol.TelemetryRequest{
+		ProtocolVersion:              1,
+		CPUUsageBasisPoints:          7850,
+		MemoryTotalBytes:             33554432000,
+		MemoryUsedBytes:              20971520000,
+		MemoryAvailableBytes:         12582912000,
+		Load1mMilli:                  4500,
+		Load5mMilli:                  3200,
+		Load15mMilli:                 1800,
+		RootFilesystemTotalBytes:     214748364800,
+		RootFilesystemUsedBytes:      107374182400,
+		RootFilesystemAvailableBytes: 107374182400,
+		NetworkReceiveBytesTotal:     52428800,
+		NetworkTransmitBytesTotal:    26214400,
+		UptimeSeconds:                7200,
+		SampleWindowMS:               29500,
+	}
+
+	err = db.RecordAgentTelemetry(ctx, keyH, telemReq2)
+	if err != nil {
+		t.Fatalf("RecordAgentTelemetry failed on second update: %v", err)
+	}
+
+	var (
+		scannedTelemAgentID2  string
+		scannedCPU2           int
+		scannedMemTotal2      int64
+		scannedMemUsed2       int64
+		scannedMemAvail2      int64
+		scannedLoad1_2        int64
+		scannedLoad5_2        int64
+		scannedLoad15_2       int64
+		scannedFSTotal2       int64
+		scannedFSUsed2        int64
+		scannedFSAvail2       int64
+		scannedNetRX2         int64
+		scannedNetTX2         int64
+		scannedUptime2        int64
+		scannedWindow2        int64
+		secondTelemReportedAt time.Time
+	)
+	err = db.pool.QueryRow(ctx, `
+		SELECT agent_id, cpu_usage_basis_points, memory_total_bytes, memory_used_bytes, memory_available_bytes,
+		       load_1m_milli, load_5m_milli, load_15m_milli,
+		       root_filesystem_total_bytes, root_filesystem_used_bytes, root_filesystem_available_bytes,
+		       network_receive_bytes_total, network_transmit_bytes_total,
+		       uptime_seconds, sample_window_ms, reported_at
+		FROM stackpilot.agent_telemetry
+		WHERE agent_id = $1::uuid
+	`, agentH.ID).Scan(
+		&scannedTelemAgentID2,
+		&scannedCPU2,
+		&scannedMemTotal2,
+		&scannedMemUsed2,
+		&scannedMemAvail2,
+		&scannedLoad1_2,
+		&scannedLoad5_2,
+		&scannedLoad15_2,
+		&scannedFSTotal2,
+		&scannedFSUsed2,
+		&scannedFSAvail2,
+		&scannedNetRX2,
+		&scannedNetTX2,
+		&scannedUptime2,
+		&scannedWindow2,
+		&secondTelemReportedAt,
+	)
+	if err != nil {
+		t.Fatalf("failed to query updated agent_telemetry: %v", err)
+	}
+
+	if scannedTelemAgentID2 != agentH.ID {
+		t.Fatalf("expected agent_id unchanged (%q), got %q", agentH.ID, scannedTelemAgentID2)
+	}
+	if scannedCPU2 != telemReq2.CPUUsageBasisPoints {
+		t.Fatalf("expected cpu %d, got %d", telemReq2.CPUUsageBasisPoints, scannedCPU2)
+	}
+	if scannedMemTotal2 != telemReq2.MemoryTotalBytes {
+		t.Fatalf("expected memory_total %d, got %d", telemReq2.MemoryTotalBytes, scannedMemTotal2)
+	}
+	if scannedMemUsed2 != telemReq2.MemoryUsedBytes {
+		t.Fatalf("expected memory_used %d, got %d", telemReq2.MemoryUsedBytes, scannedMemUsed2)
+	}
+	if scannedMemAvail2 != telemReq2.MemoryAvailableBytes {
+		t.Fatalf("expected memory_available %d, got %d", telemReq2.MemoryAvailableBytes, scannedMemAvail2)
+	}
+	if scannedLoad1_2 != telemReq2.Load1mMilli {
+		t.Fatalf("expected load1 %d, got %d", telemReq2.Load1mMilli, scannedLoad1_2)
+	}
+	if scannedLoad5_2 != telemReq2.Load5mMilli {
+		t.Fatalf("expected load5 %d, got %d", telemReq2.Load5mMilli, scannedLoad5_2)
+	}
+	if scannedLoad15_2 != telemReq2.Load15mMilli {
+		t.Fatalf("expected load15 %d, got %d", telemReq2.Load15mMilli, scannedLoad15_2)
+	}
+	if scannedFSTotal2 != telemReq2.RootFilesystemTotalBytes {
+		t.Fatalf("expected fs_total %d, got %d", telemReq2.RootFilesystemTotalBytes, scannedFSTotal2)
+	}
+	if scannedFSUsed2 != telemReq2.RootFilesystemUsedBytes {
+		t.Fatalf("expected fs_used %d, got %d", telemReq2.RootFilesystemUsedBytes, scannedFSUsed2)
+	}
+	if scannedFSAvail2 != telemReq2.RootFilesystemAvailableBytes {
+		t.Fatalf("expected fs_available %d, got %d", telemReq2.RootFilesystemAvailableBytes, scannedFSAvail2)
+	}
+	if scannedNetRX2 != telemReq2.NetworkReceiveBytesTotal {
+		t.Fatalf("expected net_rx %d, got %d", telemReq2.NetworkReceiveBytesTotal, scannedNetRX2)
+	}
+	if scannedNetTX2 != telemReq2.NetworkTransmitBytesTotal {
+		t.Fatalf("expected net_tx %d, got %d", telemReq2.NetworkTransmitBytesTotal, scannedNetTX2)
+	}
+	if scannedUptime2 != telemReq2.UptimeSeconds {
+		t.Fatalf("expected uptime %d, got %d", telemReq2.UptimeSeconds, scannedUptime2)
+	}
+	if scannedWindow2 != telemReq2.SampleWindowMS {
+		t.Fatalf("expected sample_window_ms %d, got %d", telemReq2.SampleWindowMS, scannedWindow2)
+	}
+	if secondTelemReportedAt.Before(firstTelemReportedAt) {
+		t.Fatalf("expected second reported_at (%v) to be >= first (%v)", secondTelemReportedAt, firstTelemReportedAt)
+	}
+
+	var telemRowCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_telemetry WHERE agent_id = $1::uuid", agentH.ID).Scan(&telemRowCount)
+	if err != nil {
+		t.Fatalf("failed to count agent_telemetry rows: %v", err)
+	}
+	if telemRowCount != 1 {
+		t.Fatalf("expected exactly 1 telemetry snapshot row, got %d", telemRowCount)
+	}
+
+	var totalTelemBeforeUnknown int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_telemetry").Scan(&totalTelemBeforeUnknown)
+	if err != nil {
+		t.Fatalf("failed to count total agent_telemetry rows before unknown attempt: %v", err)
+	}
+
+	err = db.RecordAgentTelemetry(ctx, keyUnknownH, telemReq1)
+	if err == nil {
+		t.Fatal("expected error for unknown public key telemetry, got nil")
+	}
+	if !errors.Is(err, enrollment.ErrAgentNotFound) {
+		t.Fatalf("expected ErrAgentNotFound for unknown public key telemetry, got %v", err)
+	}
+
+	var totalTelemAfterUnknown int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.agent_telemetry").Scan(&totalTelemAfterUnknown)
+	if err != nil {
+		t.Fatalf("failed to count total agent_telemetry rows after unknown attempt: %v", err)
+	}
+	if totalTelemAfterUnknown != totalTelemBeforeUnknown {
+		t.Fatalf("expected total telemetry row count to remain %d, got %d", totalTelemBeforeUnknown, totalTelemAfterUnknown)
 	}
 
 	// Ensure database created_at is reasonable

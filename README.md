@@ -5,9 +5,9 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.8 stage (Server Inventory Foundation). It is pre-release and **NOT** production-ready.
+StackPilot is currently in the M0.9 stage (Metrics & Runtime Telemetry Foundation). It is pre-release and **NOT** production-ready.
 
-Collected inventory (current snapshot only):
+Collected server inventory (current snapshot only):
 - Hostname
 - OS ID / name / version
 - Kernel release
@@ -15,18 +15,26 @@ Collected inventory (current snapshot only):
 - Logical CPU count
 - Total RAM
 
-Inventory behavior:
-- Immediate collection and submission after first successful heartbeat
-- Periodic refresh approximately every 1 hour with jitter (±10%)
-- Current snapshot only (persisted in `stackpilot.agent_inventory`, one row per agent)
+Collected runtime telemetry (current snapshot only):
+- CPU usage (basis points, derived across consecutive samples)
+- Memory total / used / available bytes
+- Load averages (1m, 5m, 15m in milli)
+- Root filesystem total / used / available bytes (mounted at `/`)
+- Aggregate network receive / transmit byte counters (excluding `lo`)
+- Uptime seconds
+
+Telemetry behavior:
+- Sequential execution within the existing Agent presence loop
+- Captured approximately at heartbeat cadence (~30 seconds with jitter)
+- Stores only the latest snapshot per Agent in `stackpilot.agent_telemetry` (one row per agent)
+- No historical time series yet
 
 Strict boundaries:
-- No runtime CPU metrics
-- No runtime RAM metrics
-- No disk metrics
-- No applications
-- No commands
-- No UI
+- Pre-release and not production-ready
+- No historical monitoring or time-series database
+- No commands or jobs
+- No UI or dashboards
+- No application orchestration yet
 
 ## Development
 To build and test the project locally, you need:

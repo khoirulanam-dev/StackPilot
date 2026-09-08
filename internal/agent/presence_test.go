@@ -421,6 +421,7 @@ func TestPresence_DeterministicLoop(t *testing.T) {
 		cfg.jitterFunc = func(base time.Duration, pct float64) time.Duration {
 			return base
 		}
+		cfg.sampler = &noopTelemetrySampler{}
 
 		_ = runPresenceWithConfig(ctx, logger, stateDir, cfg)
 

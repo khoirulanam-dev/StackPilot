@@ -11,8 +11,8 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatalf("getEmbeddedMigrations() failed: %v", err)
 	}
 
-	if len(migrations) != 5 {
-		t.Fatalf("expected exactly 5 migrations, got %d", len(migrations))
+	if len(migrations) != 6 {
+		t.Fatalf("expected exactly 6 migrations, got %d", len(migrations))
 	}
 
 	// Verify exact migration order
@@ -21,6 +21,7 @@ func TestEmbeddedMigrations(t *testing.T) {
 	expected003 := "003_create_agents.sql"
 	expected004 := "004_add_agent_presence.sql"
 	expected005 := "005_create_agent_inventory.sql"
+	expected006 := "006_create_agent_telemetry.sql"
 
 	if migrations[0] != expected001 {
 		t.Errorf("expected first migration %q, got %q", expected001, migrations[0])
@@ -36,6 +37,9 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if migrations[4] != expected005 {
 		t.Errorf("expected fifth migration %q, got %q", expected005, migrations[4])
+	}
+	if migrations[5] != expected006 {
+		t.Errorf("expected sixth migration %q, got %q", expected006, migrations[5])
 	}
 
 	// Verify migration 001 contents
@@ -220,6 +224,75 @@ func TestEmbeddedMigrations(t *testing.T) {
 		if strings.Contains(normalized005, keyword) {
 			t.Errorf("migration 005 contains prohibited term %q", keyword)
 		}
+	}
+
+	// Verify migration 006 contents
+	content006, err := migrationsFS.ReadFile("migrations/" + expected006)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected006, err)
+	}
+	sql006 := string(content006)
+
+	requiredClauses006 := []string{
+		"CREATE TABLE stackpilot.agent_telemetry",
+		"agent_id uuid PRIMARY KEY REFERENCES stackpilot.agents(id) ON DELETE CASCADE",
+		"cpu_usage_basis_points integer NOT NULL",
+		"memory_total_bytes bigint NOT NULL",
+		"memory_used_bytes bigint NOT NULL",
+		"memory_available_bytes bigint NOT NULL",
+		"load_1m_milli bigint NOT NULL",
+		"load_5m_milli bigint NOT NULL",
+		"load_15m_milli bigint NOT NULL",
+		"root_filesystem_total_bytes bigint NOT NULL",
+		"root_filesystem_used_bytes bigint NOT NULL",
+		"root_filesystem_available_bytes bigint NOT NULL",
+		"network_receive_bytes_total bigint NOT NULL",
+		"network_transmit_bytes_total bigint NOT NULL",
+		"uptime_seconds bigint NOT NULL",
+		"sample_window_ms bigint NOT NULL",
+		"reported_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT agent_telemetry_cpu_usage_basis_points_check",
+		"CONSTRAINT agent_telemetry_memory_total_bytes_check",
+		"CONSTRAINT agent_telemetry_memory_available_bytes_check",
+		"CONSTRAINT agent_telemetry_memory_used_bytes_check",
+		"CONSTRAINT agent_telemetry_load_1m_milli_check",
+		"CONSTRAINT agent_telemetry_load_5m_milli_check",
+		"CONSTRAINT agent_telemetry_load_15m_milli_check",
+		"CONSTRAINT agent_telemetry_root_filesystem_total_bytes_check",
+		"CONSTRAINT agent_telemetry_root_filesystem_used_bytes_check",
+		"CONSTRAINT agent_telemetry_root_filesystem_available_bytes_check",
+		"CONSTRAINT agent_telemetry_network_receive_bytes_total_check",
+		"CONSTRAINT agent_telemetry_network_transmit_bytes_total_check",
+		"CONSTRAINT agent_telemetry_uptime_seconds_check",
+		"CONSTRAINT agent_telemetry_sample_window_ms_check",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.agent_telemetry;",
+	}
+	for _, clause := range requiredClauses006 {
+		if !strings.Contains(sql006, clause) {
+			t.Errorf("migration 006 missing required clause %q", clause)
+		}
+	}
+
+	normalized006 := strings.ToLower(sql006)
+	prohibitedKeywords006 := []string{
+		"jsonb",
+		"raw_payload",
+		"history",
+		"timescale",
+		"prometheus",
+		"collected_at",
+		"client_timestamp",
+	}
+	for _, keyword := range prohibitedKeywords006 {
+		if strings.Contains(normalized006, keyword) {
+			t.Errorf("migration 006 contains prohibited term %q", keyword)
+		}
+	}
+
+	parts006 := strings.Split(sql006, "---- create above / drop below ----")
+	if len(parts006) == 2 && strings.Contains(strings.ToLower(parts006[1]), "cascade") {
+		t.Errorf("migration 006 drop statement must not use CASCADE: %s", parts006[1])
 	}
 }
 

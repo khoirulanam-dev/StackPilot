@@ -135,3 +135,250 @@ func TestValidateInventoryString_UnicodeAndCharacters(t *testing.T) {
 		t.Fatal("expected ValidateInventoryRequest with invalid UTF-8 OSName to fail")
 	}
 }
+
+func TestTelemetryProtocolDefinitions(t *testing.T) {
+	if TelemetryEndpointPath != "/api/v1/agent/telemetry" {
+		t.Fatalf("unexpected TelemetryEndpointPath: %s", TelemetryEndpointPath)
+	}
+
+	validReq := TelemetryRequest{
+		ProtocolVersion:              CurrentVersion,
+		CPUUsageBasisPoints:          2500,
+		MemoryTotalBytes:             16777216000,
+		MemoryUsedBytes:              8388608000,
+		MemoryAvailableBytes:         8388608000,
+		Load1mMilli:                  1250,
+		Load5mMilli:                  1100,
+		Load15mMilli:                 950,
+		RootFilesystemTotalBytes:     107374182400,
+		RootFilesystemUsedBytes:      42949672960,
+		RootFilesystemAvailableBytes: 59055800320,
+		NetworkReceiveBytesTotal:     104857600,
+		NetworkTransmitBytesTotal:    52428800,
+		UptimeSeconds:                86400,
+		SampleWindowMS:               30000,
+	}
+
+	data, err := json.Marshal(validReq)
+	if err != nil {
+		t.Fatalf("failed to marshal TelemetryRequest: %v", err)
+	}
+
+	var parsed TelemetryRequest
+	if err := json.Unmarshal(data, &parsed); err != nil {
+		t.Fatalf("failed to unmarshal TelemetryRequest: %v", err)
+	}
+
+	if parsed != validReq {
+		t.Fatalf("unmarshaled TelemetryRequest mismatch: got %+v, want %+v", parsed, validReq)
+	}
+}
+
+func TestValidateTelemetryRequest(t *testing.T) {
+	validReq := func() TelemetryRequest {
+		return TelemetryRequest{
+			ProtocolVersion:              CurrentVersion,
+			CPUUsageBasisPoints:          2500,
+			MemoryTotalBytes:             1000,
+			MemoryUsedBytes:              600,
+			MemoryAvailableBytes:         400,
+			Load1mMilli:                  1000,
+			Load5mMilli:                  1000,
+			Load15mMilli:                 1000,
+			RootFilesystemTotalBytes:     10000,
+			RootFilesystemUsedBytes:      4000,
+			RootFilesystemAvailableBytes: 5000, // 5000 <= 10000-4000 (reserved blocks)
+			NetworkReceiveBytesTotal:     200,
+			NetworkTransmitBytesTotal:    300,
+			UptimeSeconds:                120,
+			SampleWindowMS:               30000,
+		}
+	}
+
+	if err := ValidateTelemetryRequest(nil); err == nil {
+		t.Fatal("expected error for nil request")
+	}
+
+	t.Run("valid_request", func(t *testing.T) {
+		r := validReq()
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected validation error: %v", err)
+		}
+	})
+
+	t.Run("protocol_version", func(t *testing.T) {
+		r := validReq()
+		r.ProtocolVersion = 0
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for protocol_version 0")
+		}
+		r.ProtocolVersion = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative protocol_version")
+		}
+	})
+
+	t.Run("cpu_usage_basis_points", func(t *testing.T) {
+		r := validReq()
+		r.CPUUsageBasisPoints = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative CPUUsageBasisPoints")
+		}
+		r.CPUUsageBasisPoints = 0
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for 0 basis points: %v", err)
+		}
+		r.CPUUsageBasisPoints = 10000
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for 10000 basis points: %v", err)
+		}
+		r.CPUUsageBasisPoints = 10001
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for 10001 CPUUsageBasisPoints")
+		}
+	})
+
+	t.Run("memory", func(t *testing.T) {
+		r := validReq()
+		r.MemoryTotalBytes = 0
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for zero total memory")
+		}
+		r = validReq()
+		r.MemoryTotalBytes = -100
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative total memory")
+		}
+
+		r = validReq()
+		r.MemoryAvailableBytes = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative available memory")
+		}
+
+		r = validReq()
+		r.MemoryAvailableBytes = r.MemoryTotalBytes + 1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for available > total memory")
+		}
+
+		r = validReq()
+		r.MemoryUsedBytes = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative used memory")
+		}
+
+		r = validReq()
+		r.MemoryUsedBytes = r.MemoryTotalBytes - r.MemoryAvailableBytes + 1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for inconsistent used memory != total - available")
+		}
+	})
+
+	t.Run("load", func(t *testing.T) {
+		r := validReq()
+		r.Load1mMilli = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative Load1mMilli")
+		}
+		r = validReq()
+		r.Load5mMilli = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative Load5mMilli")
+		}
+		r = validReq()
+		r.Load15mMilli = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative Load15mMilli")
+		}
+	})
+
+	t.Run("filesystem", func(t *testing.T) {
+		r := validReq()
+		r.RootFilesystemTotalBytes = 0
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for zero total filesystem")
+		}
+		r = validReq()
+		r.RootFilesystemTotalBytes = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative total filesystem")
+		}
+
+		r = validReq()
+		r.RootFilesystemUsedBytes = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative used filesystem")
+		}
+
+		r = validReq()
+		r.RootFilesystemUsedBytes = r.RootFilesystemTotalBytes + 1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for used > total filesystem")
+		}
+
+		r = validReq()
+		r.RootFilesystemAvailableBytes = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative available filesystem")
+		}
+
+		r = validReq()
+		r.RootFilesystemAvailableBytes = r.RootFilesystemTotalBytes - r.RootFilesystemUsedBytes + 1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for available > total - used")
+		}
+
+		// Reserved-blocks case: available < total - used must be valid
+		r = validReq()
+		r.RootFilesystemAvailableBytes = r.RootFilesystemTotalBytes - r.RootFilesystemUsedBytes - 100
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for reserved-blocks case (available < total - used): %v", err)
+		}
+	})
+
+	t.Run("network", func(t *testing.T) {
+		r := validReq()
+		r.NetworkReceiveBytesTotal = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative NetworkReceiveBytesTotal")
+		}
+		r = validReq()
+		r.NetworkTransmitBytesTotal = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative NetworkTransmitBytesTotal")
+		}
+	})
+
+	t.Run("uptime", func(t *testing.T) {
+		r := validReq()
+		r.UptimeSeconds = -1
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for negative UptimeSeconds")
+		}
+		r.UptimeSeconds = 0
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for 0 UptimeSeconds: %v", err)
+		}
+	})
+
+	t.Run("sample_window_ms", func(t *testing.T) {
+		r := validReq()
+		r.SampleWindowMS = 0
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for sample_window_ms = 0")
+		}
+		r.SampleWindowMS = 1
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for sample_window_ms = 1: %v", err)
+		}
+		r.SampleWindowMS = 300000
+		if err := ValidateTelemetryRequest(&r); err != nil {
+			t.Fatalf("unexpected error for sample_window_ms = 300000: %v", err)
+		}
+		r.SampleWindowMS = 300001
+		if err := ValidateTelemetryRequest(&r); err == nil {
+			t.Fatal("expected error for sample_window_ms = 300001")
+		}
+	})
+}

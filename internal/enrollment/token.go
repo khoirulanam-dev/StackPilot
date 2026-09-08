@@ -61,6 +61,11 @@ type AgentInventoryRecorder interface {
 	RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error
 }
 
+// AgentTelemetryRecorder defines the contract for recording Agent telemetry.
+type AgentTelemetryRecorder interface {
+	RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req *protocol.TelemetryRequest) error
+}
+
 // TokenRecord represents safe metadata returned after persisting an enrollment token.
 type TokenRecord struct {
 	ID        string
