@@ -65,7 +65,10 @@ jobs:
         run: go build -o build/stackpilot-controller ./cmd/controller
 
       - name: Go Build Agent
-        run: go build -o build/stackpilot-agent ./cmd/agent
+        run: CGO_ENABLED=0 go build -o build/stackpilot-agent ./cmd/agent
+
+      - name: Go Build Agent Helper
+        run: CGO_ENABLED=0 go build -o build/stackpilot-agent-helper ./cmd/agent-helper
 
       - name: Setup pnpm
         uses: pnpm/setup@703c52620218391530e48b9e8870d5c0082e1b9b # v2.1.0

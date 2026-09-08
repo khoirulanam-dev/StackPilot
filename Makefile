@@ -4,7 +4,8 @@ build: web-build
 	@echo "Building Go binaries..."
 	mkdir -p build
 	go build -o build/stackpilot-controller ./cmd/controller
-	go build -o build/stackpilot-agent ./cmd/agent
+	CGO_ENABLED=0 go build -o build/stackpilot-agent ./cmd/agent
+	CGO_ENABLED=0 go build -o build/stackpilot-agent-helper ./cmd/agent-helper
 
 test:
 	@echo "Running tests..."

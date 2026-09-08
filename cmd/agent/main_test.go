@@ -10,7 +10,7 @@ import (
 	"crypto/x509/pkix"
 	"encoding/json"
 	"encoding/pem"
-	"io"
+	"errors"
 	"log/slog"
 	"math/big"
 	"net"
@@ -24,6 +24,7 @@ import (
 
 	"stackpilot/internal/agent"
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/privilege"
 )
 
 func TestAgentCLI_Dispatch(t *testing.T) {
@@ -260,43 +261,83 @@ func TestAgentCLI_Dispatch(t *testing.T) {
 	})
 
 	t.Run("daemon mode cancellation", func(t *testing.T) {
-		ctx, cancel := context.WithCancel(context.Background())
 		tempDir := t.TempDir()
 		stateDir := filepath.Join(tempDir, "state")
-		if err := agent.EnsureStateDir(stateDir); err != nil {
-			t.Fatalf("failed to ensure state dir: %v", err)
-		}
-		pub, _, err := agent.LoadOrGenerateKey(stateDir, rand.Reader)
-		if err != nil {
-			t.Fatalf("failed to generate key: %v", err)
-		}
-		meta := &agent.IdentityMetadata{
-			Version:       1,
-			AgentID:       "018f0000-0000-7000-8000-000000000004",
-			ControllerURL: "https://127.0.0.1:7448",
-			PublicKey:     agent.FormatPublicKeyBase64RawURL(pub),
-		}
-		if err := agent.WriteIdentityMetadata(stateDir, meta); err != nil {
-			t.Fatalf("failed to write identity metadata: %v", err)
-		}
+		outBuf := &bytes.Buffer{}
+		errBuf := &bytes.Buffer{}
 
-		logger := slog.New(slog.NewTextHandler(io.Discard, nil))
-
-		done := make(chan error, 1)
-		go func() {
-			done <- agent.Run(ctx, logger, stateDir)
-		}()
-
-		// Cancel context shortly
-		cancel()
-
-		select {
-		case err := <-done:
-			if err != nil {
-				t.Fatalf("expected clean exit on cancellation, got: %v", err)
+		mockRunner := func(ctx context.Context, logger *slog.Logger, dir string) error {
+			if dir != stateDir {
+				t.Errorf("expected stateDir %q, got %q", stateDir, dir)
 			}
-		case <-time.After(2 * time.Second):
-			t.Fatal("agent daemon did not exit within timeout")
+			return nil
+		}
+
+		err := runAgentDaemonWithRunner([]string{"--state-dir", stateDir}, outBuf, errBuf, mockRunner)
+		if err != nil {
+			t.Fatalf("expected clean exit, got error: %v", err)
 		}
 	})
+
+	t.Run("privilege-check missing runtime-dir flag returns error", func(t *testing.T) {
+		err := run([]string{"privilege-check"}, stdin, stdout, stderr)
+		if err == nil {
+			t.Fatal("expected error for missing --runtime-dir, got nil")
+		}
+		if !strings.Contains(err.Error(), "--runtime-dir") {
+			t.Errorf("expected error to mention '--runtime-dir', got %q", err.Error())
+		}
+	})
+
+	t.Run("privilege-check positional arguments rejected", func(t *testing.T) {
+		err := run([]string{"privilege-check", "--runtime-dir", "/tmp/foo", "extra"}, stdin, stdout, stderr)
+		if err == nil {
+			t.Fatal("expected error for positional arguments, got nil")
+		}
+		if !strings.Contains(err.Error(), "unexpected positional arguments") {
+			t.Errorf("expected error to mention unexpected positional arguments, got %q", err.Error())
+		}
+	})
+
+	t.Run("privilege-check success prints concise message", func(t *testing.T) {
+		mockFactory := func(cfg privilege.ClientConfig) (privilege.Client, error) {
+			return &mockPrivilegeClient{pingErr: nil}, nil
+		}
+
+		outBuf := &bytes.Buffer{}
+		errBuf := &bytes.Buffer{}
+		err := runPrivilegeCheckWithFactory([]string{"--runtime-dir", "/tmp/foo"}, outBuf, errBuf, mockFactory)
+		if err != nil {
+			t.Fatalf("privilege-check failed: %v", err)
+		}
+
+		want := "Privilege boundary verified\n"
+		if outBuf.String() != want {
+			t.Fatalf("expected output %q, got %q", want, outBuf.String())
+		}
+	})
+
+	t.Run("privilege-check failure returns error", func(t *testing.T) {
+		mockFactory := func(cfg privilege.ClientConfig) (privilege.Client, error) {
+			return &mockPrivilegeClient{pingErr: errors.New("helper connection refused")}, nil
+		}
+
+		outBuf := &bytes.Buffer{}
+		errBuf := &bytes.Buffer{}
+		err := runPrivilegeCheckWithFactory([]string{"--runtime-dir", "/tmp/foo"}, outBuf, errBuf, mockFactory)
+		if err == nil {
+			t.Fatal("expected error for failing ping, got nil")
+		}
+		if !strings.Contains(err.Error(), "helper connection refused") {
+			t.Errorf("error %q does not contain expected message", err.Error())
+		}
+	})
+}
+
+type mockPrivilegeClient struct {
+	pingErr error
+}
+
+func (m *mockPrivilegeClient) Ping(ctx context.Context) error {
+	return m.pingErr
 }

@@ -13,7 +13,10 @@ import (
 	"syscall"
 
 	"stackpilot/internal/agent"
+	"stackpilot/internal/privilege"
 )
+
+type privilegeClientFactory func(cfg privilege.ClientConfig) (privilege.Client, error)
 
 func main() {
 	if err := run(os.Args[1:], os.Stdin, os.Stdout, os.Stderr); err != nil {
@@ -32,12 +35,20 @@ func run(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
 		return runEnroll(args[1:], stdin, stdout, stderr)
 	case "transport-check":
 		return runTransportCheck(args[1:], stdout, stderr)
+	case "privilege-check":
+		return runPrivilegeCheck(args[1:], stdout, stderr)
 	default:
-		return fmt.Errorf("unknown command %q (supported: enroll, transport-check)", args[0])
+		return fmt.Errorf("unknown command %q (supported: enroll, transport-check, privilege-check)", args[0])
 	}
 }
 
+type agentDaemonRunner func(ctx context.Context, logger *slog.Logger, stateDir string) error
+
 func runAgentDaemon(args []string, stdout, stderr io.Writer) error {
+	return runAgentDaemonWithRunner(args, stdout, stderr, agent.Run)
+}
+
+func runAgentDaemonWithRunner(args []string, stdout, stderr io.Writer, runner agentDaemonRunner) error {
 	fs := flag.NewFlagSet("stackpilot-agent", flag.ContinueOnError)
 	fs.SetOutput(stderr)
 
@@ -59,7 +70,7 @@ func runAgentDaemon(args []string, stdout, stderr io.Writer) error {
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
 
-	return agent.Run(ctx, logger, *stateDir)
+	return runner(ctx, logger, *stateDir)
 }
 
 func runEnroll(args []string, stdin io.Reader, stdout, stderr io.Writer) error {
@@ -131,5 +142,45 @@ func runTransportCheck(args []string, stdout, stderr io.Writer) error {
 	}
 
 	fmt.Fprintf(stdout, "Secure transport verified: %s\n", agentID)
+	return nil
+}
+
+func runPrivilegeCheck(args []string, stdout, stderr io.Writer) error {
+	return runPrivilegeCheckWithFactory(args, stdout, stderr, privilege.NewClient)
+}
+
+func runPrivilegeCheckWithFactory(args []string, stdout, stderr io.Writer, factory privilegeClientFactory) error {
+	fs := flag.NewFlagSet("privilege-check", flag.ContinueOnError)
+	fs.SetOutput(stderr)
+
+	runtimeDir := fs.String("runtime-dir", "", "Helper runtime directory containing agent-helper.sock")
+
+	if err := fs.Parse(args); err != nil {
+		return err
+	}
+
+	if fs.NArg() > 0 {
+		return errors.New("unexpected positional arguments")
+	}
+
+	if *runtimeDir == "" {
+		return fmt.Errorf("missing required flag --runtime-dir")
+	}
+
+	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
+	defer stop()
+
+	client, err := factory(privilege.ClientConfig{
+		RuntimeDir: *runtimeDir,
+	})
+	if err != nil {
+		return err
+	}
+
+	if err := client.Ping(ctx); err != nil {
+		return err
+	}
+
+	fmt.Fprintln(stdout, "Privilege boundary verified")
 	return nil
 }

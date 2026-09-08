@@ -5,7 +5,29 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.11 stage (Job & Typed Action Engine). It is pre-release and **NOT** production-ready.
+StackPilot is currently in the M0.12 stage (Agent Privilege Boundary). It is pre-release and **NOT** production-ready.
+
+Agent Privilege Boundary:
+- Dedicated non-root Agent daemon: main Agent must run as non-root (EUID != 0)
+- Kernel capability boundary: main Agent rejects non-zero Linux capabilities (`CapInh`, `CapPrm`, `CapEff`, `CapAmb`) across all runtime threads (`/proc/self/task/<tid>/status`)
+- Process-wide hardening: both Agent daemon and helper enforce `PR_SET_NO_NEW_PRIVS = 1` across all Go runtime OS threads via `syscall.AllThreadsSyscall` and `PR_SET_DUMPABLE = 0`
+- Pure Go builds: Agent and helper production binaries are built with `CGO_ENABLED=0` to guarantee process-wide runtime thread security invariants
+- Separate root helper: `stackpilot-agent-helper` runs as root (EUID == 0) and exposes no network listeners
+- Local transport: `AF_UNIX SOCK_SEQPACKET` exclusively (`agent-helper.sock`)
+- Mutual SO_PEERCRED authentication: helper authenticates the caller matches the configured non-root Agent UID; Agent verifies helper peer UID is 0 (root)
+- Strict runtime directory invariants: root-owned directory (`0750`), root:Agent-group socket (`0660`), no symlinks allowed
+- Local privilege protocol: version 1, operation strictly `boundary.ping` with canonical UUID validation and zero privileged OS side-effects
+- Remote job model preserved: Controller job action remains strictly `agent.ping`; Controller wire protocol remains version 2; database schema version remains 12
+- No real server operations yet
+
+Local Trust Model:
+- Helper runs as root (UID 0) to manage system-level boundaries.
+- Agent runs as a dedicated, unprivileged non-root service UID.
+- Helper accepts connections ONLY from that exact authorized Agent UID via kernel-verified `SO_PEERCRED`.
+- Any code executing under the dedicated Agent UID can attempt local helper socket calls; therefore, the production Agent service account must be dedicated and non-login.
+- A strict typed helper allowlist (`boundary.ping` only) limits blast radius.
+- The Unix domain socket proves local UID identity but does NOT prove that an individual request originated from Controller.
+- Controller-signed local capabilities are NOT implemented in M0.12.
 
 Job & Typed Action Engine:
 - Typed action domain: `agent.ping` ONLY
