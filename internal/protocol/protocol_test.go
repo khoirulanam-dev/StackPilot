@@ -6,8 +6,8 @@ import (
 )
 
 func TestProtocolDefinitions(t *testing.T) {
-	if CurrentVersion != 1 {
-		t.Fatalf("expected CurrentVersion = 1, got %d", CurrentVersion)
+	if CurrentVersion != 2 {
+		t.Fatalf("expected CurrentVersion = 2, got %d", CurrentVersion)
 	}
 
 	if HeartbeatEndpointPath != "/api/v1/agent/heartbeat" {
@@ -16,6 +16,14 @@ func TestProtocolDefinitions(t *testing.T) {
 
 	if InventoryEndpointPath != "/api/v1/agent/inventory" {
 		t.Fatalf("unexpected InventoryEndpointPath: %s", InventoryEndpointPath)
+	}
+
+	if AgentJobStartEndpointPath != "/api/v1/agent/job/start" {
+		t.Fatalf("unexpected AgentJobStartEndpointPath: %s", AgentJobStartEndpointPath)
+	}
+
+	if AgentJobCompleteEndpointPath != "/api/v1/agent/job/complete" {
+		t.Fatalf("unexpected AgentJobCompleteEndpointPath: %s", AgentJobCompleteEndpointPath)
 	}
 
 	req := HeartbeatRequest{ProtocolVersion: CurrentVersion}
@@ -379,6 +387,143 @@ func TestValidateTelemetryRequest(t *testing.T) {
 		r.SampleWindowMS = 300001
 		if err := ValidateTelemetryRequest(&r); err == nil {
 			t.Fatal("expected error for sample_window_ms = 300001")
+		}
+	})
+}
+
+func TestValidateJobStartRequest(t *testing.T) {
+	validID := "0191bc8d-0a70-7115-9988-123456789abc"
+
+	t.Run("valid_request", func(t *testing.T) {
+		req := &JobStartRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+		}
+		if err := ValidateJobStartRequest(req); err != nil {
+			t.Fatalf("expected valid start request: %v", err)
+		}
+	})
+
+	t.Run("nil_request", func(t *testing.T) {
+		if err := ValidateJobStartRequest(nil); err == nil {
+			t.Fatal("expected error for nil request")
+		}
+	})
+
+	t.Run("invalid_version", func(t *testing.T) {
+		req := &JobStartRequest{
+			ProtocolVersion: CurrentVersion + 1,
+			JobID:           validID,
+			Attempt:         1,
+		}
+		if err := ValidateJobStartRequest(req); err == nil {
+			t.Fatal("expected error for mismatched protocol version")
+		}
+	})
+
+	t.Run("invalid_job_id", func(t *testing.T) {
+		req := &JobStartRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           "invalid-uuid",
+			Attempt:         1,
+		}
+		if err := ValidateJobStartRequest(req); err == nil {
+			t.Fatal("expected error for invalid job_id")
+		}
+	})
+
+	t.Run("attempt_out_of_range", func(t *testing.T) {
+		req := &JobStartRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         0,
+		}
+		if err := ValidateJobStartRequest(req); err == nil {
+			t.Fatal("expected error for attempt 0")
+		}
+		req.Attempt = 6
+		if err := ValidateJobStartRequest(req); err == nil {
+			t.Fatal("expected error for attempt 6")
+		}
+	})
+}
+
+func TestValidateJobCompleteRequest(t *testing.T) {
+	validID := "0191bc8d-0a70-7115-9988-123456789abc"
+
+	t.Run("valid_succeeded", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "succeeded",
+		}
+		if err := ValidateJobCompleteRequest(req); err != nil {
+			t.Fatalf("expected valid succeeded request: %v", err)
+		}
+	})
+
+	t.Run("valid_failed", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "failed",
+			FailureCode:     "executor_error",
+		}
+		if err := ValidateJobCompleteRequest(req); err != nil {
+			t.Fatalf("expected valid failed request: %v", err)
+		}
+	})
+
+	t.Run("succeeded_with_failure_code_rejected", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "succeeded",
+			FailureCode:     "executor_error",
+		}
+		if err := ValidateJobCompleteRequest(req); err == nil {
+			t.Fatal("expected error for succeeded outcome with failure code")
+		}
+	})
+
+	t.Run("failed_without_failure_code_rejected", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "failed",
+		}
+		if err := ValidateJobCompleteRequest(req); err == nil {
+			t.Fatal("expected error for failed outcome without failure code")
+		}
+	})
+
+	t.Run("failed_with_wrong_failure_code_rejected", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "failed",
+			FailureCode:     "dispatch_exhausted",
+		}
+		if err := ValidateJobCompleteRequest(req); err == nil {
+			t.Fatal("expected error for failed outcome with non-executor_error failure code")
+		}
+	})
+
+	t.Run("invalid_outcome", func(t *testing.T) {
+		req := &JobCompleteRequest{
+			ProtocolVersion: CurrentVersion,
+			JobID:           validID,
+			Attempt:         1,
+			Outcome:         "cancelled",
+		}
+		if err := ValidateJobCompleteRequest(req); err == nil {
+			t.Fatal("expected error for invalid outcome")
 		}
 	})
 }

@@ -8,6 +8,7 @@ import (
 	"crypto/tls"
 	"crypto/x509"
 	"crypto/x509/pkix"
+	"encoding/json"
 	"encoding/pem"
 	"errors"
 	"io"
@@ -22,6 +23,9 @@ import (
 	"sync"
 	"testing"
 	"time"
+
+	"stackpilot/internal/job"
+	"stackpilot/internal/protocol"
 )
 
 func setupTestEnrolledState(t *testing.T, controllerURL string) (string, [32]byte, []byte) {
@@ -641,4 +645,186 @@ func TestComputeBackoff_MaxJitterCap(t *testing.T) {
 	if gotBelow != 27*time.Second {
 		t.Fatalf("expected backoff below max to remain %v, got %v", 27*time.Second, gotBelow)
 	}
+}
+
+type fakeSeamExecutor struct {
+	mu         sync.Mutex
+	callCount  int
+	lastAction string
+	executeErr error
+}
+
+func (f *fakeSeamExecutor) Execute(ctx context.Context, action string) error {
+	f.mu.Lock()
+	defer f.mu.Unlock()
+	f.callCount++
+	f.lastAction = action
+	return f.executeErr
+}
+
+func TestPresence_JobLifecycle(t *testing.T) {
+	t.Run("heartbeat assignment triggers start, execute, and complete", func(t *testing.T) {
+		var (
+			mu            sync.Mutex
+			hbCount       int
+			startCount    int
+			completeCount int
+			lastComplete  protocol.JobCompleteRequest
+		)
+
+		jobID := "018f0000-0000-7000-8000-000000000099"
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			switch r.URL.Path {
+			case protocol.HeartbeatEndpointPath:
+				hbCount++
+				if hbCount == 1 {
+					// Return job assignment on first heartbeat
+					w.Header().Set("Content-Type", "application/json")
+					_ = json.NewEncoder(w).Encode(protocol.HeartbeatResponse{
+						ProtocolVersion: protocol.CurrentVersion,
+						Job: &protocol.JobAssignment{
+							JobID:   jobID,
+							Attempt: 1,
+							Action:  string(job.ActionAgentPing),
+						},
+					})
+					return
+				}
+				w.WriteHeader(http.StatusNoContent)
+
+			case protocol.AgentJobStartEndpointPath:
+				startCount++
+				w.WriteHeader(http.StatusNoContent)
+
+			case protocol.AgentJobCompleteEndpointPath:
+				completeCount++
+				_ = json.NewDecoder(r.Body).Decode(&lastComplete)
+				w.WriteHeader(http.StatusNoContent)
+
+			default:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		})
+
+		_, caPEM, ts := setupTestCAAndServer(t, handler)
+		defer ts.Close()
+
+		stateDir, _, _ := setupTestEnrolledState(t, ts.URL)
+		caFile := filepath.Join(stateDir, "custom-ca.pem")
+		_ = os.WriteFile(caFile, caPEM, 0644)
+		_ = ValidateAndPersistCAFile(stateDir, caFile)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		mockExec := &fakeSeamExecutor{}
+		cfg := defaultPresenceConfig()
+		cfg.executor = mockExec
+		cfg.timerFunc = func(d time.Duration) (<-chan time.Time, func() bool) {
+			cancel() // cancel after first pass
+			ch := make(chan time.Time)
+			return ch, func() bool { return true }
+		}
+
+		err := runPresenceWithConfig(ctx, nil, stateDir, cfg)
+		if err != nil {
+			t.Fatalf("expected clean exit, got %v", err)
+		}
+
+		mu.Lock()
+		defer mu.Unlock()
+
+		if hbCount < 1 {
+			t.Errorf("expected heartbeat called, got %d", hbCount)
+		}
+		if startCount != 1 {
+			t.Errorf("expected exactly 1 start request, got %d", startCount)
+		}
+		if mockExec.callCount != 1 {
+			t.Errorf("expected executor called exactly once, got %d", mockExec.callCount)
+		}
+		if mockExec.lastAction != string(job.ActionAgentPing) {
+			t.Errorf("expected action agent.ping, got %q", mockExec.lastAction)
+		}
+		if completeCount != 1 {
+			t.Errorf("expected exactly 1 complete request, got %d", completeCount)
+		}
+		if lastComplete.Outcome != "succeeded" {
+			t.Errorf("expected outcome succeeded, got %q", lastComplete.Outcome)
+		}
+		if lastComplete.JobID != jobID {
+			t.Errorf("expected job ID %q, got %q", jobID, lastComplete.JobID)
+		}
+	})
+
+	t.Run("start conflict drops assignment without executing", func(t *testing.T) {
+		var (
+			mu         sync.Mutex
+			startCount int
+		)
+
+		jobID := "018f0000-0000-7000-8000-000000000098"
+
+		handler := http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+			mu.Lock()
+			defer mu.Unlock()
+
+			switch r.URL.Path {
+			case protocol.HeartbeatEndpointPath:
+				w.Header().Set("Content-Type", "application/json")
+				_ = json.NewEncoder(w).Encode(protocol.HeartbeatResponse{
+					ProtocolVersion: protocol.CurrentVersion,
+					Job: &protocol.JobAssignment{
+						JobID:   jobID,
+						Attempt: 1,
+						Action:  string(job.ActionAgentPing),
+					},
+				})
+
+			case protocol.AgentJobStartEndpointPath:
+				startCount++
+				// Controller rejects start (e.g. stale lease or duplicate start)
+				w.WriteHeader(http.StatusConflict)
+
+			default:
+				w.WriteHeader(http.StatusNoContent)
+			}
+		})
+
+		_, caPEM, ts := setupTestCAAndServer(t, handler)
+		defer ts.Close()
+
+		stateDir, _, _ := setupTestEnrolledState(t, ts.URL)
+		caFile := filepath.Join(stateDir, "custom-ca.pem")
+		_ = os.WriteFile(caFile, caPEM, 0644)
+		_ = ValidateAndPersistCAFile(stateDir, caFile)
+
+		ctx, cancel := context.WithCancel(context.Background())
+		defer cancel()
+
+		mockExec := &fakeSeamExecutor{}
+		cfg := defaultPresenceConfig()
+		cfg.executor = mockExec
+		cfg.timerFunc = func(d time.Duration) (<-chan time.Time, func() bool) {
+			cancel()
+			ch := make(chan time.Time)
+			return ch, func() bool { return true }
+		}
+
+		err := runPresenceWithConfig(ctx, nil, stateDir, cfg)
+		if err != nil {
+			t.Fatalf("expected clean exit, got %v", err)
+		}
+
+		if startCount != 1 {
+			t.Errorf("expected 1 start call, got %d", startCount)
+		}
+		if mockExec.callCount != 0 {
+			t.Errorf("expected executor NOT called on start conflict, got %d", mockExec.callCount)
+		}
+	})
 }

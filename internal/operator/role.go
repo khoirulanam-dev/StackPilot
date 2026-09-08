@@ -16,6 +16,7 @@ type Permission string
 
 const (
 	PermissionServersRead       Permission = "servers.read"
+	PermissionJobsRead          Permission = "jobs.read"
 	PermissionOperationsExecute Permission = "operations.execute"
 	PermissionOperatorsManage   Permission = "operators.manage"
 	PermissionAuditRead         Permission = "audit.read"
@@ -45,11 +46,14 @@ func (r Role) Valid() bool {
 func (r Role) HasPermission(p Permission) bool {
 	switch r {
 	case RoleViewer:
-		return p == PermissionServersRead
+		return p == PermissionServersRead || p == PermissionJobsRead
 	case RoleOperator:
-		return p == PermissionServersRead || p == PermissionOperationsExecute
+		return p == PermissionServersRead ||
+			p == PermissionJobsRead ||
+			p == PermissionOperationsExecute
 	case RoleAdmin:
 		return p == PermissionServersRead ||
+			p == PermissionJobsRead ||
 			p == PermissionOperationsExecute ||
 			p == PermissionOperatorsManage ||
 			p == PermissionAuditRead

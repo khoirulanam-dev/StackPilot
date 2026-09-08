@@ -8,6 +8,8 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"stackpilot/internal/protocol"
 )
 
@@ -141,7 +143,7 @@ func TestFindAgentByPublicKey_Uninitialized(t *testing.T) {
 func TestRecordAgentHeartbeat_Uninitialized(t *testing.T) {
 	db := &DB{}
 	var key [32]byte
-	_, err := db.RecordAgentHeartbeat(context.Background(), key, 1)
+	_, _, err := db.RecordAgentHeartbeat(context.Background(), key, 1)
 	if err == nil {
 		t.Fatal("expected error on uninitialized pool, got nil")
 	}
@@ -194,5 +196,33 @@ func TestRecordAgentTelemetry_Uninitialized(t *testing.T) {
 	err := db.RecordAgentTelemetry(context.Background(), key, req)
 	if err == nil {
 		t.Fatal("expected error on uninitialized pool, got nil")
+	}
+}
+
+func TestJobs_UninitializedPool(t *testing.T) {
+	db := &DB{}
+	ctx := context.Background()
+	u := uuid.New()
+
+	if _, _, err := db.CreateJob(ctx, u, u, "agent.ping", [32]byte{}); err == nil {
+		t.Fatal("expected error on uninitialized pool for CreateJob")
+	}
+	if _, err := db.GetJobByID(ctx, u); err == nil {
+		t.Fatal("expected error on uninitialized pool for GetJobByID")
+	}
+	if _, err := db.ListJobs(ctx, 10, nil, nil); err == nil {
+		t.Fatal("expected error on uninitialized pool for ListJobs")
+	}
+	if _, err := db.ListJobEvents(ctx, u, 10); err == nil {
+		t.Fatal("expected error on uninitialized pool for ListJobEvents")
+	}
+	if _, err := db.ClaimNextAgentJob(ctx, u); err == nil {
+		t.Fatal("expected error on uninitialized pool for ClaimNextAgentJob")
+	}
+	if err := db.StartAgentJob(ctx, u, u, 1); err == nil {
+		t.Fatal("expected error on uninitialized pool for StartAgentJob")
+	}
+	if err := db.CompleteAgentJob(ctx, u, u, 1, "succeeded", ""); err == nil {
+		t.Fatal("expected error on uninitialized pool for CompleteAgentJob")
 	}
 }

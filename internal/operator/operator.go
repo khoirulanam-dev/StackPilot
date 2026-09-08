@@ -40,6 +40,7 @@ const (
 	ActionOperatorLogin     AuditAction = "operator.login"
 	ActionOperatorLogout    AuditAction = "operator.logout"
 	ActionOperatorAuditRead AuditAction = "operator.audit.read"
+	ActionJobCreated        AuditAction = "job.created"
 )
 
 // AuditOutcome represents typed audit outcome states.
@@ -86,5 +87,6 @@ type AuditEventRecord struct {
 	Action           AuditAction  `json:"action"`
 	TargetOperatorID *string      `json:"target_operator_id"`
 	TargetUsername   *string      `json:"target_username"`
+	TargetJobID      *string      `json:"target_job_id"`
 	Outcome          AuditOutcome `json:"outcome"`
 }

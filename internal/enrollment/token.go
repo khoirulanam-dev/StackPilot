@@ -53,7 +53,7 @@ type AgentFinder interface {
 
 // AgentHeartbeatRecorder defines the contract for recording an Agent heartbeat.
 type AgentHeartbeatRecorder interface {
-	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*AgentRecord, error)
+	RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*AgentRecord, bool, error)
 }
 
 // AgentInventoryRecorder defines the contract for recording Agent inventory.

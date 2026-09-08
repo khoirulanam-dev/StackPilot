@@ -16,7 +16,9 @@ import (
 	"net/http"
 	"net/url"
 	"time"
+	"unicode/utf8"
 
+	"stackpilot/internal/job"
 	"stackpilot/internal/protocol"
 )
 
@@ -147,6 +149,7 @@ type presenceConfig struct {
 	inventoryRetryInterval time.Duration
 	collector              func() (*protocol.InventoryRequest, error)
 	sampler                telemetrySampler
+	executor               TypedExecutor
 }
 
 func defaultPresenceConfig() presenceConfig {
@@ -163,6 +166,7 @@ func defaultPresenceConfig() presenceConfig {
 		inventoryRetryInterval: DefaultInventoryRetryInterval,
 		collector:              collectLinuxInventory,
 		sampler:                newTelemetrySampler(),
+		executor:               NewExecutor(),
 	}
 }
 
@@ -261,10 +265,16 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 	heartbeatURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.HeartbeatEndpointPath}).String()
 	inventoryURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.InventoryEndpointPath}).String()
 	telemetryURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.TelemetryEndpointPath}).String()
+	jobStartURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.AgentJobStartEndpointPath}).String()
+	jobCompleteURL := ctrlURL.ResolveReference(&url.URL{Path: protocol.AgentJobCompleteEndpointPath}).String()
 
 	sampler := cfg.sampler
 	if sampler == nil {
 		sampler = &noopTelemetrySampler{}
+	}
+	executor := cfg.executor
+	if executor == nil {
+		executor = NewExecutor()
 	}
 
 	consecutiveFailures := 0
@@ -273,6 +283,8 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 	var nextInventoryAt time.Time
 	inventoryFailureLogged := false
 	telemetryFailureLogged := false
+
+	var pendingCompletion *protocol.JobCompleteRequest
 
 	for {
 		if ctx.Err() != nil {
@@ -287,7 +299,7 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 			return fmt.Errorf("%w: %v", ErrPermanentFailure, err)
 		}
 
-		hbErr := sendHeartbeat(ctx, client, heartbeatURL)
+		assignment, hbErr := sendHeartbeat(ctx, client, heartbeatURL)
 		if hbErr != nil {
 			if ctx.Err() != nil {
 				return nil
@@ -324,6 +336,66 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 				loggedFailure = false
 			}
 			consecutiveFailures = 0
+
+			if pendingCompletion != nil {
+				compErr := sendJobComplete(ctx, client, jobCompleteURL, pendingCompletion)
+				if compErr != nil {
+					if IsPermanentError(compErr) {
+						return compErr
+					}
+					// If terminal conflict (e.g. late completion became unknown), drop pending completion
+					if errors.Is(compErr, job.ErrJobConflict) {
+						pendingCompletion = nil
+					}
+				} else {
+					pendingCompletion = nil
+				}
+			}
+
+			if pendingCompletion == nil && assignment != nil {
+				if err := protocol.ValidateJobAssignment(assignment); err != nil {
+					return fmt.Errorf("%w: invalid job assignment: %v", ErrPermanentFailure, err)
+				}
+
+				// At-most-once execution contract: heartbeat delivery does not authorize execution; start must return HTTP 204
+				startErr := sendJobStart(ctx, client, jobStartURL, assignment.JobID, assignment.Attempt)
+				if startErr != nil {
+					if IsPermanentError(startErr) {
+						return startErr
+					}
+					// If start returned 409 or network error: drop assignment safely, do not execute
+					assignment = nil
+				} else {
+					var execOutcome string
+					var execFailureCode string
+					if err := executor.Execute(ctx, assignment.Action); err != nil {
+						execOutcome = "failed"
+						execFailureCode = "executor_error"
+					} else {
+						execOutcome = "succeeded"
+						execFailureCode = ""
+					}
+
+					completionReq := &protocol.JobCompleteRequest{
+						ProtocolVersion: protocol.CurrentVersion,
+						JobID:           assignment.JobID,
+						Attempt:         assignment.Attempt,
+						Outcome:         execOutcome,
+						FailureCode:     execFailureCode,
+					}
+
+					compErr := sendJobComplete(ctx, client, jobCompleteURL, completionReq)
+					if compErr != nil {
+						if IsPermanentError(compErr) {
+							return compErr
+						}
+						// Transient network/timeout/5xx: retain in memory for next heartbeat retry
+						if !errors.Is(compErr, job.ErrJobConflict) {
+							pendingCompletion = completionReq
+						}
+					}
+				}
+			}
 
 			inventoryNow := cfg.nowFunc()
 			if nextInventoryAt.IsZero() || !inventoryNow.Before(nextInventoryAt) {
@@ -450,12 +522,12 @@ func runPresenceWithConfig(ctx context.Context, logger *slog.Logger, stateDir st
 	}
 }
 
-func sendHeartbeat(ctx context.Context, client *http.Client, targetURL string) error {
+func sendHeartbeat(ctx context.Context, client *http.Client, targetURL string) (*protocol.JobAssignment, error) {
 	reqPayload, err := json.Marshal(protocol.HeartbeatRequest{
 		ProtocolVersion: protocol.CurrentVersion,
 	})
 	if err != nil {
-		return fmt.Errorf("%w: failed to marshal heartbeat payload", ErrPermanentFailure)
+		return nil, fmt.Errorf("%w: failed to marshal heartbeat payload", ErrPermanentFailure)
 	}
 
 	reqCtx, reqCancel := context.WithTimeout(ctx, DefaultClientTimeout)
@@ -463,13 +535,96 @@ func sendHeartbeat(ctx context.Context, client *http.Client, targetURL string) e
 
 	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(reqPayload))
 	if err != nil {
-		return fmt.Errorf("%w: failed to construct heartbeat request: %v", ErrPermanentFailure, err)
+		return nil, fmt.Errorf("%w: failed to construct heartbeat request: %v", ErrPermanentFailure, err)
 	}
 	httpReq.Header.Set("Content-Type", "application/json")
 
 	resp, err := client.Do(httpReq)
 	if err != nil {
-		return err // Transient network/TLS error
+		return nil, err // Transient network/TLS error
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		_ = resp.Body.Close()
+	}()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil, nil
+	case http.StatusOK:
+		bodyBytes, err := io.ReadAll(io.LimitReader(resp.Body, 1025))
+		if err != nil {
+			return nil, fmt.Errorf("%w: failed to read heartbeat response body: %v", ErrPermanentFailure, err)
+		}
+		if len(bodyBytes) > 1024 {
+			return nil, fmt.Errorf("%w: heartbeat response body too large", ErrPermanentFailure)
+		}
+		if !utf8.Valid(bodyBytes) {
+			return nil, fmt.Errorf("%w: heartbeat response is not valid UTF-8", ErrPermanentFailure)
+		}
+		var hbResp protocol.HeartbeatResponse
+		dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+		dec.DisallowUnknownFields()
+		if err := dec.Decode(&hbResp); err != nil {
+			return nil, fmt.Errorf("%w: malformed heartbeat response: %v", ErrPermanentFailure, err)
+		}
+		var extra any
+		if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+			return nil, fmt.Errorf("%w: trailing data in heartbeat response", ErrPermanentFailure)
+		}
+		if hbResp.ProtocolVersion != protocol.CurrentVersion {
+			return nil, ErrProtocolMismatch
+		}
+		if hbResp.Job == nil {
+			return nil, fmt.Errorf("%w: HTTP 200 heartbeat missing job assignment", ErrPermanentFailure)
+		}
+		if err := protocol.ValidateJobAssignment(hbResp.Job); err != nil {
+			return nil, fmt.Errorf("%w: invalid job assignment: %v", ErrPermanentFailure, err)
+		}
+		return hbResp.Job, nil
+	case http.StatusUnauthorized:
+		return nil, ErrAuthRejected
+	case http.StatusConflict:
+		return nil, ErrProtocolMismatch
+	case http.StatusBadRequest:
+		return nil, fmt.Errorf("%w: request rejected by controller (400)", ErrPermanentFailure)
+	case http.StatusTooManyRequests:
+		return nil, errors.New("heartbeat rate limited by controller (429)")
+	default:
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			return nil, fmt.Errorf("controller error (status %d)", resp.StatusCode)
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode <= 499 {
+			return nil, fmt.Errorf("%w: unexpected client error (status %d)", ErrPermanentFailure, resp.StatusCode)
+		}
+		return nil, fmt.Errorf("unexpected heartbeat response status %d", resp.StatusCode)
+	}
+}
+
+// sendJobStart issues POST /api/v1/agent/job/start with bounded 5s timeout.
+// Returns nil on HTTP 204 (authorizing execution), or an error.
+func sendJobStart(ctx context.Context, client *http.Client, targetURL string, jobID string, attempt int) error {
+	reqPayload, err := json.Marshal(protocol.JobStartRequest{
+		ProtocolVersion: protocol.CurrentVersion,
+		JobID:           jobID,
+		Attempt:         attempt,
+	})
+	if err != nil {
+		return fmt.Errorf("%w: failed to marshal start payload", ErrPermanentFailure)
+	}
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer reqCancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(reqPayload))
+	if err != nil {
+		return fmt.Errorf("%w: failed to construct start request: %v", ErrPermanentFailure, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return err // Transient network error
 	}
 	defer func() {
 		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
@@ -482,18 +637,63 @@ func sendHeartbeat(ctx context.Context, client *http.Client, targetURL string) e
 	case http.StatusUnauthorized:
 		return ErrAuthRejected
 	case http.StatusConflict:
-		return ErrProtocolMismatch
-	case http.StatusBadRequest:
-		return fmt.Errorf("%w: request rejected by controller (400)", ErrPermanentFailure)
+		// Job-state 409 or protocol conflict: caller will inspect or drop assignment safely
+		return job.ErrJobConflict
 	case http.StatusTooManyRequests:
-		return errors.New("heartbeat rate limited by controller (429)")
+		return errors.New("start rate limited by controller (429)")
 	default:
 		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
-			return fmt.Errorf("controller error (status %d)", resp.StatusCode)
+			return fmt.Errorf("controller start error (status %d)", resp.StatusCode)
 		}
 		if resp.StatusCode >= 400 && resp.StatusCode <= 499 {
 			return fmt.Errorf("%w: unexpected client error (status %d)", ErrPermanentFailure, resp.StatusCode)
 		}
-		return fmt.Errorf("unexpected heartbeat response status %d", resp.StatusCode)
+		return fmt.Errorf("unexpected start response status %d", resp.StatusCode)
+	}
+}
+
+// sendJobComplete issues POST /api/v1/agent/job/complete with bounded 5s timeout.
+// Returns nil on HTTP 204 (completion accepted/replayed).
+func sendJobComplete(ctx context.Context, client *http.Client, targetURL string, req *protocol.JobCompleteRequest) error {
+	reqPayload, err := json.Marshal(req)
+	if err != nil {
+		return fmt.Errorf("%w: failed to marshal complete payload", ErrPermanentFailure)
+	}
+
+	reqCtx, reqCancel := context.WithTimeout(ctx, 5*time.Second)
+	defer reqCancel()
+
+	httpReq, err := http.NewRequestWithContext(reqCtx, http.MethodPost, targetURL, bytes.NewReader(reqPayload))
+	if err != nil {
+		return fmt.Errorf("%w: failed to construct complete request: %v", ErrPermanentFailure, err)
+	}
+	httpReq.Header.Set("Content-Type", "application/json")
+
+	resp, err := client.Do(httpReq)
+	if err != nil {
+		return err // Transient network error
+	}
+	defer func() {
+		_, _ = io.Copy(io.Discard, io.LimitReader(resp.Body, 1024))
+		_ = resp.Body.Close()
+	}()
+
+	switch resp.StatusCode {
+	case http.StatusNoContent:
+		return nil
+	case http.StatusUnauthorized:
+		return ErrAuthRejected
+	case http.StatusConflict:
+		return job.ErrJobConflict
+	case http.StatusTooManyRequests:
+		return errors.New("complete rate limited by controller (429)")
+	default:
+		if resp.StatusCode >= 500 && resp.StatusCode <= 599 {
+			return fmt.Errorf("controller complete error (status %d)", resp.StatusCode)
+		}
+		if resp.StatusCode >= 400 && resp.StatusCode <= 499 {
+			return fmt.Errorf("%w: unexpected client error (status %d)", ErrPermanentFailure, resp.StatusCode)
+		}
+		return fmt.Errorf("unexpected complete response status %d", resp.StatusCode)
 	}
 }

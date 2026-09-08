@@ -45,6 +45,9 @@ func TestRole_RBACMatrix(t *testing.T) {
 		if !RoleViewer.HasPermission(PermissionServersRead) {
 			t.Error("viewer must have servers.read")
 		}
+		if !RoleViewer.HasPermission(PermissionJobsRead) {
+			t.Error("viewer must have jobs.read")
+		}
 		if RoleViewer.HasPermission(PermissionOperationsExecute) {
 			t.Error("viewer must not have operations.execute")
 		}
@@ -60,6 +63,9 @@ func TestRole_RBACMatrix(t *testing.T) {
 		if !RoleOperator.HasPermission(PermissionServersRead) {
 			t.Error("operator must have servers.read")
 		}
+		if !RoleOperator.HasPermission(PermissionJobsRead) {
+			t.Error("operator must have jobs.read")
+		}
 		if !RoleOperator.HasPermission(PermissionOperationsExecute) {
 			t.Error("operator must have operations.execute")
 		}
@@ -74,6 +80,9 @@ func TestRole_RBACMatrix(t *testing.T) {
 	t.Run("admin role permissions", func(t *testing.T) {
 		if !RoleAdmin.HasPermission(PermissionServersRead) {
 			t.Error("admin must have servers.read")
+		}
+		if !RoleAdmin.HasPermission(PermissionJobsRead) {
+			t.Error("admin must have jobs.read")
 		}
 		if !RoleAdmin.HasPermission(PermissionOperationsExecute) {
 			t.Error("admin must have operations.execute")
@@ -91,6 +100,7 @@ func TestRole_RBACMatrix(t *testing.T) {
 		unknownRole := Role("custom_role")
 		allPerms := []Permission{
 			PermissionServersRead,
+			PermissionJobsRead,
 			PermissionOperationsExecute,
 			PermissionOperatorsManage,
 			PermissionAuditRead,

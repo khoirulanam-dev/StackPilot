@@ -11,8 +11,8 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatalf("getEmbeddedMigrations() failed: %v", err)
 	}
 
-	if len(migrations) != 9 {
-		t.Fatalf("expected exactly 9 migrations, got %d", len(migrations))
+	if len(migrations) != 12 {
+		t.Fatalf("expected exactly 12 migrations, got %d", len(migrations))
 	}
 
 	// Verify exact migration order
@@ -25,6 +25,9 @@ func TestEmbeddedMigrations(t *testing.T) {
 	expected007 := "007_create_operators.sql"
 	expected008 := "008_create_operator_sessions.sql"
 	expected009 := "009_create_operator_audit_events.sql"
+	expected010 := "010_create_jobs.sql"
+	expected011 := "011_create_job_events.sql"
+	expected012 := "012_add_job_target_to_operator_audit.sql"
 
 	if migrations[0] != expected001 {
 		t.Errorf("expected first migration %q, got %q", expected001, migrations[0])
@@ -52,6 +55,15 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if migrations[8] != expected009 {
 		t.Errorf("expected ninth migration %q, got %q", expected009, migrations[8])
+	}
+	if migrations[9] != expected010 {
+		t.Errorf("expected tenth migration %q, got %q", expected010, migrations[9])
+	}
+	if migrations[10] != expected011 {
+		t.Errorf("expected eleventh migration %q, got %q", expected011, migrations[10])
+	}
+	if migrations[11] != expected012 {
+		t.Errorf("expected twelfth migration %q, got %q", expected012, migrations[11])
 	}
 
 	// Verify migration 001 contents
@@ -410,6 +422,121 @@ func TestEmbeddedMigrations(t *testing.T) {
 	normalized009 := strings.ToLower(sql009)
 	if strings.Contains(normalized009, "json") {
 		t.Errorf("migration 009 must not contain JSON/JSONB: %s", sql009)
+	}
+
+	// Verify migration 010 contents
+	content010, err := migrationsFS.ReadFile("migrations/" + expected010)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected010, err)
+	}
+	sql010 := string(content010)
+	requiredClauses010 := []string{
+		"CREATE TABLE stackpilot.jobs",
+		"id uuid PRIMARY KEY DEFAULT uuidv7()",
+		"agent_id uuid NOT NULL REFERENCES stackpilot.agents(id) ON DELETE RESTRICT",
+		"created_by_operator_id uuid NOT NULL REFERENCES stackpilot.operators(id) ON DELETE RESTRICT",
+		"created_by_username text NOT NULL",
+		"idempotency_key_hash bytea NOT NULL",
+		"action_type text NOT NULL",
+		"state text NOT NULL",
+		"attempt integer NOT NULL DEFAULT 0",
+		"failure_code text NULL",
+		"created_at timestamptz NOT NULL DEFAULT now()",
+		"updated_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT jobs_created_by_username_length",
+		"CONSTRAINT jobs_created_by_username_format",
+		"CONSTRAINT jobs_idempotency_key_hash_length",
+		"CONSTRAINT jobs_action_type_check CHECK (action_type IN ('agent.ping'))",
+		"CONSTRAINT jobs_state_check CHECK (state IN ('queued', 'dispatched', 'running', 'succeeded', 'failed', 'unknown'))",
+		"CONSTRAINT jobs_attempt_range CHECK (attempt >= 0 AND attempt <= 5)",
+		"CONSTRAINT jobs_failure_code_check",
+		"CONSTRAINT jobs_state_failure_code_consistency",
+		"CONSTRAINT jobs_finished_at_consistency",
+		"CREATE INDEX jobs_claim_idx ON stackpilot.jobs (agent_id, state, created_at, id);",
+		"CREATE INDEX jobs_listing_idx ON stackpilot.jobs (created_at DESC, id DESC);",
+		"CREATE INDEX jobs_creator_idx ON stackpilot.jobs (created_by_operator_id);",
+		"CREATE UNIQUE INDEX jobs_idempotency_idx ON stackpilot.jobs (created_by_operator_id, idempotency_key_hash);",
+		"CREATE UNIQUE INDEX jobs_agent_inflight_idx ON stackpilot.jobs (agent_id) WHERE state IN ('dispatched', 'running');",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.jobs;",
+	}
+	for _, clause := range requiredClauses010 {
+		if !strings.Contains(sql010, clause) {
+			t.Errorf("migration 010 missing required clause %q", clause)
+		}
+	}
+	parts010 := strings.Split(sql010, "---- create above / drop below ----")
+	if len(parts010) == 2 && strings.Contains(strings.ToLower(parts010[1]), "cascade") {
+		t.Errorf("migration 010 drop statement must not use CASCADE: %s", parts010[1])
+	}
+	normalized010 := strings.ToLower(sql010)
+	if strings.Contains(normalized010, "json") {
+		t.Errorf("migration 010 must not contain JSON/JSONB: %s", sql010)
+	}
+
+	// Verify migration 011 contents
+	content011, err := migrationsFS.ReadFile("migrations/" + expected011)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected011, err)
+	}
+	sql011 := string(content011)
+	requiredClauses011 := []string{
+		"CREATE TABLE stackpilot.job_events",
+		"id uuid PRIMARY KEY DEFAULT uuidv7()",
+		"job_id uuid NOT NULL REFERENCES stackpilot.jobs(id) ON DELETE CASCADE",
+		"event_type text NOT NULL",
+		"attempt integer NOT NULL",
+		"actor_type text NOT NULL",
+		"actor_identifier text NOT NULL",
+		"failure_code text NULL",
+		"occurred_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT job_events_event_type_check",
+		"CONSTRAINT job_events_actor_type_check",
+		"CONSTRAINT job_events_attempt_range",
+		"CONSTRAINT job_events_failure_code_check",
+		"CONSTRAINT job_events_actor_identifier_length",
+		"CONSTRAINT job_events_actor_identifier_shape",
+		"CREATE INDEX job_events_job_id_occurred_at_idx ON stackpilot.job_events (job_id, occurred_at ASC, id ASC);",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.job_events;",
+	}
+	for _, clause := range requiredClauses011 {
+		if !strings.Contains(sql011, clause) {
+			t.Errorf("migration 011 missing required clause %q", clause)
+		}
+	}
+	parts011 := strings.Split(sql011, "---- create above / drop below ----")
+	if len(parts011) == 2 && strings.Contains(strings.ToLower(parts011[1]), "cascade") {
+		t.Errorf("migration 011 drop statement must not use CASCADE: %s", parts011[1])
+	}
+	normalized011 := strings.ToLower(sql011)
+	if strings.Contains(normalized011, "json") {
+		t.Errorf("migration 011 must not contain JSON/JSONB: %s", sql011)
+	}
+
+	// Verify migration 012 contents
+	content012, err := migrationsFS.ReadFile("migrations/" + expected012)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected012, err)
+	}
+	sql012 := string(content012)
+	requiredClauses012 := []string{
+		"ALTER TABLE stackpilot.operator_audit_events",
+		"ADD COLUMN target_job_id uuid NULL REFERENCES stackpilot.jobs(id) ON DELETE SET NULL;",
+		"ADD CONSTRAINT operator_audit_events_target_mutual_exclusion",
+		"CHECK (target_operator_id IS NULL OR target_job_id IS NULL);",
+		"---- create above / drop below ----",
+		"DROP CONSTRAINT IF EXISTS operator_audit_events_target_mutual_exclusion;",
+		"DROP COLUMN IF EXISTS target_job_id;",
+	}
+	for _, clause := range requiredClauses012 {
+		if !strings.Contains(sql012, clause) {
+			t.Errorf("migration 012 missing required clause %q", clause)
+		}
+	}
+	parts012 := strings.Split(sql012, "---- create above / drop below ----")
+	if len(parts012) == 2 && strings.Contains(strings.ToLower(parts012[1]), "cascade") {
+		t.Errorf("migration 012 drop statement must not use CASCADE: %s", parts012[1])
 	}
 }
 

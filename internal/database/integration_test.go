@@ -10,12 +10,16 @@ import (
 	"fmt"
 	"os"
 	"strings"
+	"sync"
 	"testing"
 	"time"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/job"
 	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
+
+	"github.com/google/uuid"
 )
 
 func TestPostgreSQLIntegration(t *testing.T) {
@@ -54,14 +58,14 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 9 (migrations 001-009 applied)
+	// 5. Verify migration version is 12 (migrations 001-012 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 9 {
-		t.Fatalf("expected schema version 9, got %d", version)
+	if version != 12 {
+		t.Fatalf("expected schema version 12, got %d", version)
 	}
 
 	// 6. Run db.Migrate() a second time (idempotency check)
@@ -70,13 +74,13 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("second db.Migrate() failed: %v", err)
 	}
 
-	// 7. Verify version remains 9
+	// 7. Verify version remains 12
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 9 {
-		t.Fatalf("expected schema version to remain 9, got %d", version)
+	if version != 12 {
+		t.Fatalf("expected schema version to remain 12, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -428,9 +432,12 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 
 	// Record first heartbeat with protocol_version 1
-	recH1, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
+	recH1, hasActive1, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
 	if err != nil {
 		t.Fatalf("RecordAgentHeartbeat failed on first heartbeat: %v", err)
+	}
+	if hasActive1 {
+		t.Fatal("expected hasActiveJobs to be false for agent with no jobs")
 	}
 	if recH1.ID != agentH.ID {
 		t.Fatalf("expected agent ID %q, got %q", agentH.ID, recH1.ID)
@@ -445,9 +452,12 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	firstSeenAt := *recH1.LastSeenAt
 
 	// Record second heartbeat
-	recH2, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
+	recH2, hasActive2, err := db.RecordAgentHeartbeat(ctx, keyH, 1)
 	if err != nil {
 		t.Fatalf("RecordAgentHeartbeat failed on second heartbeat: %v", err)
+	}
+	if hasActive2 {
+		t.Fatal("expected hasActiveJobs to be false for agent with no jobs")
 	}
 	if recH2.LastSeenAt == nil {
 		t.Fatal("expected last_seen_at to be non-nil after second heartbeat")
@@ -464,7 +474,7 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	var keyUnknownH [32]byte
 	copy(keyUnknownH[:], pubKeyUnknownH)
 
-	_, err = db.RecordAgentHeartbeat(ctx, keyUnknownH, 1)
+	_, _, err = db.RecordAgentHeartbeat(ctx, keyUnknownH, 1)
 	if err == nil {
 		t.Fatal("expected error for unknown public key heartbeat, got nil")
 	}
@@ -1163,4 +1173,1074 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	}
 
 	_ = operatorOp
+}
+
+func TestPostgreSQL_M011_JobLifecycle(t *testing.T) {
+	testURL, ok := os.LookupEnv("STACKPILOT_TEST_DATABASE_URL")
+	if !ok || testURL == "" {
+		t.Log("PostgreSQL integration SKIPPED")
+		t.Skip("PostgreSQL integration SKIPPED: STACKPILOT_TEST_DATABASE_URL not set")
+	}
+
+	ctx, cancel := context.WithTimeout(context.Background(), 60*time.Second)
+	defer cancel()
+
+	db, err := Open(ctx, testURL)
+	if err != nil {
+		t.Fatalf("failed to connect to test database: %v", err)
+	}
+	defer db.Close()
+
+	if err := db.Ping(ctx); err != nil {
+		t.Fatalf("database ping failed: %v", err)
+	}
+
+	if err := db.Migrate(ctx, nil); err != nil {
+		t.Fatalf("db.Migrate failed: %v", err)
+	}
+
+	createTestOp := func(username string, role operator.Role) *operator.OperatorRecord {
+		passHash, err := operator.HashPassword("validPassword123!")
+		if err != nil {
+			t.Fatalf("failed to hash password: %v", err)
+		}
+		op, err := db.CreateOperator(ctx, username, passHash, role)
+		if err != nil {
+			t.Fatalf("failed to create operator: %v", err)
+		}
+		return op
+	}
+
+	createTestAgent := func() *enrollment.AgentRecord {
+		rawToken, err := enrollment.IssueToken(ctx, db)
+		if err != nil {
+			t.Fatalf("failed to issue token: %v", err)
+		}
+		tokenHash := enrollment.HashToken(rawToken)
+
+		pub, _, err := ed25519.GenerateKey(rand.Reader)
+		if err != nil {
+			t.Fatalf("failed to generate key: %v", err)
+		}
+		var pub32 [32]byte
+		copy(pub32[:], pub)
+
+		agentRec, _, err := db.RegisterAgent(ctx, tokenHash, pub32)
+		if err != nil {
+			t.Fatalf("failed to register agent: %v", err)
+		}
+		return agentRec
+	}
+
+	t.Run("schema_tables_columns_indexes_and_constraints", func(t *testing.T) {
+		var version int32
+		err := db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
+		if err != nil {
+			t.Fatalf("failed to query schema version: %v", err)
+		}
+		if version != 12 {
+			t.Fatalf("expected schema version 12, got %d", version)
+		}
+
+		for _, tbl := range []string{"jobs", "job_events"} {
+			var exists bool
+			err := db.pool.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM information_schema.tables
+					WHERE table_schema = 'stackpilot' AND table_name = $1
+				)
+			`, tbl).Scan(&exists)
+			if err != nil || !exists {
+				t.Fatalf("expected table stackpilot.%s to exist (err=%v)", tbl, err)
+			}
+		}
+
+		var auditColExists bool
+		err = db.pool.QueryRow(ctx, `
+			SELECT EXISTS(
+				SELECT 1 FROM information_schema.columns
+				WHERE table_schema = 'stackpilot' AND table_name = 'operator_audit_events' AND column_name = 'target_job_id'
+			)
+		`).Scan(&auditColExists)
+		if err != nil || !auditColExists {
+			t.Fatalf("expected target_job_id column on stackpilot.operator_audit_events (err=%v)", err)
+		}
+
+		expectedIndexes := []string{
+			"jobs_claim_idx",
+			"jobs_listing_idx",
+			"jobs_creator_idx",
+			"jobs_idempotency_idx",
+			"jobs_agent_inflight_idx",
+			"jobs_expired_dispatched_idx",
+			"jobs_expired_running_idx",
+			"job_events_job_id_occurred_at_idx",
+		}
+		for _, idx := range expectedIndexes {
+			var exists bool
+			err := db.pool.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM pg_indexes
+					WHERE schemaname = 'stackpilot' AND indexname = $1
+				)
+			`, idx).Scan(&exists)
+			if err != nil || !exists {
+				t.Fatalf("expected index %s to exist (err=%v)", idx, err)
+			}
+		}
+
+		expectedConstraints := []string{
+			"jobs_action_type_check",
+			"jobs_state_check",
+			"jobs_attempt_range",
+			"jobs_failure_code_check",
+			"jobs_state_failure_code_consistency",
+			"jobs_idempotency_key_hash_length",
+			"job_events_actor_identifier_shape",
+			"operator_audit_events_target_mutual_exclusion",
+		}
+		for _, con := range expectedConstraints {
+			var exists bool
+			err := db.pool.QueryRow(ctx, `
+				SELECT EXISTS(
+					SELECT 1 FROM pg_constraint
+					WHERE conname = $1
+				)
+			`, con).Scan(&exists)
+			if err != nil || !exists {
+				t.Fatalf("expected constraint %s to exist (err=%v)", con, err)
+			}
+		}
+	})
+
+	t.Run("create_job_lifecycle_atomicity_and_replay", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-create-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+		keyHash := [32]byte{0x01, 0x02, 0x03}
+
+		created, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, keyHash)
+		if err != nil {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		if !isNew {
+			t.Fatal("expected isNew=true on first creation")
+		}
+		if created.State != job.StateQueued {
+			t.Fatalf("expected state queued, got %s", created.State)
+		}
+
+		events, err := db.ListJobEvents(ctx, created.ID, 10)
+		if err != nil {
+			t.Fatalf("ListJobEvents failed: %v", err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("expected exactly 1 job event, got %d", len(events))
+		}
+		if events[0].EventType != job.EventJobCreated {
+			t.Fatalf("expected event type job.created, got %s", events[0].EventType)
+		}
+
+		var auditCount int
+		err = db.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM stackpilot.operator_audit_events
+			WHERE action = 'job.created' AND target_job_id = $1
+		`, created.ID).Scan(&auditCount)
+		if err != nil {
+			t.Fatalf("failed to query audit count: %v", err)
+		}
+		if auditCount != 1 {
+			t.Fatalf("expected exactly 1 job.created audit event, got %d", auditCount)
+		}
+
+		replayed, replayIsNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, keyHash)
+		if err != nil {
+			t.Fatalf("exact replay failed: %v", err)
+		}
+		if replayIsNew {
+			t.Fatal("expected replayIsNew=false on idempotent replay")
+		}
+		if replayed.ID != created.ID {
+			t.Fatalf("expected replayed job ID %s, got %s", created.ID, replayed.ID)
+		}
+
+		eventsAfter, _ := db.ListJobEvents(ctx, created.ID, 10)
+		if len(eventsAfter) != 1 {
+			t.Fatalf("expected still 1 event after replay, got %d", len(eventsAfter))
+		}
+		_ = db.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM stackpilot.operator_audit_events
+			WHERE action = 'job.created' AND target_job_id = $1
+		`, created.ID).Scan(&auditCount)
+		if auditCount != 1 {
+			t.Fatalf("expected audit count to remain 1 after replay, got %d", auditCount)
+		}
+
+		_, _, err = db.CreateJob(ctx, opID, agID, "different.action", keyHash)
+		if !errors.Is(err, job.ErrJobIdempotencyConflict) {
+			t.Fatalf("expected ErrJobIdempotencyConflict, got %v", err)
+		}
+
+		_, _, err = db.CreateJob(ctx, opID, uuid.New(), job.ActionAgentPing, [32]byte{0x99})
+		if !errors.Is(err, job.ErrAgentNotFound) {
+			t.Fatalf("expected ErrAgentNotFound, got %v", err)
+		}
+	})
+
+	t.Run("concurrent_exact_same_key_creation", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-conc-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+		var keyHash [32]byte
+		_, _ = rand.Read(keyHash[:])
+
+		concurrency := 10
+		type result struct {
+			j     *job.Job
+			isNew bool
+			err   error
+		}
+		resChan := make(chan result, concurrency)
+
+		for i := 0; i < concurrency; i++ {
+			go func() {
+				j, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, keyHash)
+				resChan <- result{j: j, isNew: isNew, err: err}
+			}()
+		}
+
+		var firstID uuid.UUID
+		firstCount := 0
+		replayCount := 0
+		for i := 0; i < concurrency; i++ {
+			res := <-resChan
+			if res.err != nil {
+				t.Fatalf("concurrent create job returned error: %v", res.err)
+			}
+			if firstID == uuid.Nil {
+				firstID = res.j.ID
+			} else if res.j.ID != firstID {
+				t.Fatalf("concurrent create returned different Job IDs: %s != %s", firstID, res.j.ID)
+			}
+			if res.isNew {
+				firstCount++
+			} else {
+				replayCount++
+			}
+		}
+
+		if firstCount != 1 {
+			t.Fatalf("expected exactly 1 first creation with isNew=true, got %d", firstCount)
+		}
+		if replayCount != concurrency-1 {
+			t.Fatalf("expected %d replays with isNew=false, got %d", concurrency-1, replayCount)
+		}
+
+		events, err := db.ListJobEvents(ctx, firstID, 10)
+		if err != nil {
+			t.Fatalf("failed to list events: %v", err)
+		}
+		if len(events) != 1 {
+			t.Fatalf("expected exactly 1 job event, got %d", len(events))
+		}
+
+		var auditCount int
+		err = db.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM stackpilot.operator_audit_events
+			WHERE action = 'job.created' AND target_job_id = $1
+		`, firstID).Scan(&auditCount)
+		if err != nil {
+			t.Fatalf("failed to query audit count: %v", err)
+		}
+		if auditCount != 1 {
+			t.Fatalf("expected exactly 1 audit event, got %d", auditCount)
+		}
+	})
+
+	t.Run("concurrent_queue_cap_with_distinct_operators", func(t *testing.T) {
+		ops := make([]*operator.OperatorRecord, 5)
+		for i := 0; i < 5; i++ {
+			ops[i] = createTestOp(fmt.Sprintf("op-cap-%d-%s", i, uuid.New().String()[:8]), operator.RoleAdmin)
+		}
+		ag := createTestAgent()
+		agID, _ := uuid.Parse(ag.ID)
+		primaryOpID, _ := uuid.Parse(ops[0].ID)
+
+		var lastKeyHash [32]byte
+		for i := 0; i < 63; i++ {
+			var kh [32]byte
+			_, _ = rand.Read(kh[:])
+			created, isNew, err := db.CreateJob(ctx, primaryOpID, agID, job.ActionAgentPing, kh)
+			if err != nil {
+				t.Fatalf("failed to create job %d: %v", i, err)
+			}
+			if !isNew {
+				t.Fatalf("expected isNew=true for job %d", i)
+			}
+			_ = created
+			lastKeyHash = kh
+		}
+
+		concurrency := 5
+		type capResult struct {
+			isNew bool
+			err   error
+		}
+		resChan := make(chan capResult, concurrency)
+		for i := 0; i < concurrency; i++ {
+			opID, _ := uuid.Parse(ops[i].ID)
+			go func() {
+				var kh [32]byte
+				_, _ = rand.Read(kh[:])
+				_, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+				resChan <- capResult{isNew: isNew, err: err}
+			}()
+		}
+
+		successes := 0
+		fullErrors := 0
+		for i := 0; i < concurrency; i++ {
+			res := <-resChan
+			if res.err == nil {
+				if !res.isNew {
+					t.Fatalf("expected successful creation at cap to have isNew=true")
+				}
+				successes++
+			} else if errors.Is(res.err, job.ErrQueueFull) {
+				fullErrors++
+			} else {
+				t.Fatalf("unexpected error during queue race: %v", res.err)
+			}
+		}
+
+		if successes != 1 {
+			t.Fatalf("expected exactly 1 success reaching cap 64, got %d", successes)
+		}
+		if fullErrors != concurrency-1 {
+			t.Fatalf("expected %d ErrQueueFull, got %d", concurrency-1, fullErrors)
+		}
+
+		var count int
+		err := db.pool.QueryRow(ctx, `
+			SELECT COUNT(*) FROM stackpilot.jobs
+			WHERE agent_id = $1 AND state IN ('queued', 'dispatched', 'running')
+		`, agID).Scan(&count)
+		if err != nil {
+			t.Fatalf("failed to query active count: %v", err)
+		}
+		if count != 64 {
+			t.Fatalf("expected exactly 64 active jobs, got %d", count)
+		}
+
+		var overKh [32]byte
+		_, _ = rand.Read(overKh[:])
+		_, _, err = db.CreateJob(ctx, primaryOpID, agID, job.ActionAgentPing, overKh)
+		if !errors.Is(err, job.ErrQueueFull) {
+			t.Fatalf("expected ErrQueueFull at 64 jobs, got %v", err)
+		}
+
+		replayed, replayIsNew, err := db.CreateJob(ctx, primaryOpID, agID, job.ActionAgentPing, lastKeyHash)
+		if err != nil {
+			t.Fatalf("expected idempotent replay to succeed when queue full, got: %v", err)
+		}
+		if replayIsNew {
+			t.Fatal("expected replayIsNew=false on idempotent replay at queue cap")
+		}
+		if replayed == nil {
+			t.Fatal("expected non-nil job on idempotent replay")
+		}
+	})
+
+	t.Run("claim_next_agent_job_fifo_and_inflight", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-claim-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag1 := createTestAgent()
+		ag2 := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		ag1ID, _ := uuid.Parse(ag1.ID)
+		ag2ID, _ := uuid.Parse(ag2.ID)
+
+		var kh1, kh2, khAg2 [32]byte
+		_, _ = rand.Read(kh1[:])
+		_, _ = rand.Read(kh2[:])
+		_, _ = rand.Read(khAg2[:])
+
+		j1, _, err := db.CreateJob(ctx, opID, ag1ID, job.ActionAgentPing, kh1)
+		if err != nil {
+			t.Fatalf("failed to create j1: %v", err)
+		}
+
+		_, err = db.pool.Exec(ctx, "UPDATE stackpilot.jobs SET created_at = clock_timestamp() - interval '10 seconds' WHERE id = $1", j1.ID)
+		if err != nil {
+			t.Fatalf("failed to set j1 created_at: %v", err)
+		}
+
+		j2, _, err := db.CreateJob(ctx, opID, ag1ID, job.ActionAgentPing, kh2)
+		if err != nil {
+			t.Fatalf("failed to create j2: %v", err)
+		}
+
+		jAg2, _, err := db.CreateJob(ctx, opID, ag2ID, job.ActionAgentPing, khAg2)
+		if err != nil {
+			t.Fatalf("failed to create jAg2: %v", err)
+		}
+
+		claimed1, err := db.ClaimNextAgentJob(ctx, ag1ID)
+		if err != nil {
+			t.Fatalf("ClaimNextAgentJob failed: %v", err)
+		}
+		if claimed1 == nil || claimed1.JobID != j1.ID.String() {
+			t.Fatalf("expected oldest job %s, got %v", j1.ID, claimed1)
+		}
+		if claimed1.Attempt != 1 {
+			t.Fatalf("expected attempt 1, got %d", claimed1.Attempt)
+		}
+
+		claimed2, err := db.ClaimNextAgentJob(ctx, ag1ID)
+		if err != nil {
+			t.Fatalf("ClaimNextAgentJob while in-flight failed: %v", err)
+		}
+		if claimed2 != nil {
+			t.Fatalf("expected nil when in-flight job exists, got %v", claimed2)
+		}
+
+		claimedAg2, err := db.ClaimNextAgentJob(ctx, ag2ID)
+		if err != nil {
+			t.Fatalf("ag2 claim failed: %v", err)
+		}
+		if claimedAg2 == nil || claimedAg2.JobID != jAg2.ID.String() {
+			t.Fatalf("expected ag2 job %s, got %v", jAg2.ID, claimedAg2)
+		}
+
+		_ = j2
+	})
+
+	t.Run("concurrent_different_agent_claims", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-diff-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		agA := createTestAgent()
+		agB := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agAID, _ := uuid.Parse(agA.ID)
+		agBID, _ := uuid.Parse(agB.ID)
+
+		var khA, khB [32]byte
+		_, _ = rand.Read(khA[:])
+		_, _ = rand.Read(khB[:])
+
+		jA, _, err := db.CreateJob(ctx, opID, agAID, job.ActionAgentPing, khA)
+		if err != nil {
+			t.Fatalf("failed to create job for Agent A: %v", err)
+		}
+		jB, _, err := db.CreateJob(ctx, opID, agBID, job.ActionAgentPing, khB)
+		if err != nil {
+			t.Fatalf("failed to create job for Agent B: %v", err)
+		}
+
+		startBarrier := make(chan struct{})
+		var wg sync.WaitGroup
+		wg.Add(2)
+
+		var claimA, claimB *protocol.JobAssignment
+		var errA, errB error
+
+		go func() {
+			defer wg.Done()
+			<-startBarrier
+			claimA, errA = db.ClaimNextAgentJob(ctx, agAID)
+		}()
+
+		go func() {
+			defer wg.Done()
+			<-startBarrier
+			claimB, errB = db.ClaimNextAgentJob(ctx, agBID)
+		}()
+
+		close(startBarrier)
+		wg.Wait()
+
+		if errA != nil {
+			t.Fatalf("Agent A claim failed: %v", errA)
+		}
+		if errB != nil {
+			t.Fatalf("Agent B claim failed: %v", errB)
+		}
+
+		if claimA == nil || claimA.JobID != jA.ID.String() {
+			t.Fatalf("expected Agent A to claim job %s, got %v", jA.ID, claimA)
+		}
+		if claimB == nil || claimB.JobID != jB.ID.String() {
+			t.Fatalf("expected Agent B to claim job %s, got %v", jB.ID, claimB)
+		}
+	})
+
+	t.Run("concurrent_same_agent_claims", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-conc-claim-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		for i := 0; i < 3; i++ {
+			var kh [32]byte
+			_, _ = rand.Read(kh[:])
+			_, _, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+			if err != nil {
+				t.Fatalf("failed to create job: %v", err)
+			}
+		}
+
+		concurrency := 5
+		type claimRes struct {
+			a   *protocol.JobAssignment
+			err error
+		}
+		ch := make(chan claimRes, concurrency)
+		for i := 0; i < concurrency; i++ {
+			go func() {
+				a, err := db.ClaimNextAgentJob(ctx, agID)
+				ch <- claimRes{a: a, err: err}
+			}()
+		}
+
+		claimedCount := 0
+		nilCount := 0
+		for i := 0; i < concurrency; i++ {
+			res := <-ch
+			if res.err != nil {
+				t.Fatalf("concurrent claim produced error: %v", res.err)
+			}
+			if res.a != nil {
+				claimedCount++
+			} else {
+				nilCount++
+			}
+		}
+
+		if claimedCount != 1 {
+			t.Fatalf("expected exactly 1 claim success, got %d", claimedCount)
+		}
+		if nilCount != concurrency-1 {
+			t.Fatalf("expected %d nil claims, got %d", concurrency-1, nilCount)
+		}
+	})
+
+	t.Run("start_agent_job_lifecycle_and_conflicts", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-start-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+		var kh [32]byte
+		_, _ = rand.Read(kh[:])
+
+		j, _, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+		if err != nil {
+			t.Fatalf("failed to create job: %v", err)
+		}
+
+		claimed, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimed == nil {
+			t.Fatalf("failed to claim job: %v", err)
+		}
+		claimedJobID, _ := uuid.Parse(claimed.JobID)
+
+		err = db.StartAgentJob(ctx, uuid.New(), claimedJobID, claimed.Attempt)
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict for wrong agent, got %v", err)
+		}
+
+		err = db.StartAgentJob(ctx, agID, claimedJobID, claimed.Attempt+1)
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict for wrong attempt, got %v", err)
+		}
+
+		concurrency := 5
+		errChan := make(chan error, concurrency)
+		for i := 0; i < concurrency; i++ {
+			go func() {
+				errChan <- db.StartAgentJob(ctx, agID, claimedJobID, claimed.Attempt)
+			}()
+		}
+
+		startSuccess := 0
+		startConflict := 0
+		for i := 0; i < concurrency; i++ {
+			err := <-errChan
+			if err == nil {
+				startSuccess++
+			} else if errors.Is(err, job.ErrJobConflict) {
+				startConflict++
+			} else {
+				t.Fatalf("unexpected start error: %v", err)
+			}
+		}
+
+		if startSuccess != 1 {
+			t.Fatalf("expected exactly 1 start success, got %d", startSuccess)
+		}
+		if startConflict != concurrency-1 {
+			t.Fatalf("expected %d conflicts, got %d", concurrency-1, startConflict)
+		}
+
+		runningJob, err := db.GetJobByID(ctx, claimedJobID)
+		if err != nil {
+			t.Fatalf("GetJobByID failed: %v", err)
+		}
+		if runningJob.State != job.StateRunning {
+			t.Fatalf("expected state running, got %s", runningJob.State)
+		}
+		if runningJob.ExecutionDeadlineAt == nil {
+			t.Fatal("expected non-nil ExecutionDeadlineAt")
+		}
+
+		// Expired start test: dispatch lease expired before StartAgentJob
+		// First complete runningJob to free in-flight slot
+		_ = db.CompleteAgentJob(ctx, agID, claimedJobID, claimed.Attempt, "succeeded", "")
+
+		var khExp [32]byte
+		_, _ = rand.Read(khExp[:])
+		jExp, _, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, khExp)
+		if err != nil {
+			t.Fatalf("failed to create expired job: %v", err)
+		}
+		claimedExp, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimedExp == nil {
+			t.Fatalf("failed to claim jExp: %v", err)
+		}
+		expJobID, _ := uuid.Parse(claimedExp.JobID)
+
+		_, err = db.pool.Exec(ctx, `
+			UPDATE stackpilot.jobs
+			SET dispatch_expires_at = clock_timestamp() - interval '1 second'
+			WHERE id = $1
+		`, expJobID)
+		if err != nil {
+			t.Fatalf("failed to expire dispatch lease: %v", err)
+		}
+
+		err = db.StartAgentJob(ctx, agID, expJobID, claimedExp.Attempt)
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict on expired start, got %v", err)
+		}
+
+		reconciledExp, err := db.GetJobByID(ctx, expJobID)
+		if err != nil {
+			t.Fatalf("GetJobByID failed: %v", err)
+		}
+		if reconciledExp.State != job.StateQueued {
+			t.Fatalf("expected state queued after expired start reconciliation, got %s", reconciledExp.State)
+		}
+
+		_ = j
+		_ = jExp
+	})
+
+	t.Run("complete_agent_job_outcomes_and_replay", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-comp-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var khSucc [32]byte
+		_, _ = rand.Read(khSucc[:])
+		jSuccess, _, _ := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, khSucc)
+		claimedSuccess, _ := db.ClaimNextAgentJob(ctx, agID)
+		succJobID, _ := uuid.Parse(claimedSuccess.JobID)
+		_ = db.StartAgentJob(ctx, agID, succJobID, claimedSuccess.Attempt)
+
+		err := db.CompleteAgentJob(ctx, agID, succJobID, claimedSuccess.Attempt, "succeeded", "")
+		if err != nil {
+			t.Fatalf("CompleteAgentJob success failed: %v", err)
+		}
+
+		err = db.CompleteAgentJob(ctx, agID, succJobID, claimedSuccess.Attempt, "succeeded", "")
+		if err != nil {
+			t.Fatalf("CompleteAgentJob exact replay failed: %v", err)
+		}
+
+		err = db.CompleteAgentJob(ctx, agID, succJobID, claimedSuccess.Attempt, "failed", "executor_error")
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict on conflicting replay, got %v", err)
+		}
+
+		var khFail [32]byte
+		_, _ = rand.Read(khFail[:])
+		jFail, _, _ := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, khFail)
+		claimedFail, _ := db.ClaimNextAgentJob(ctx, agID)
+		failJobID, _ := uuid.Parse(claimedFail.JobID)
+		_ = db.StartAgentJob(ctx, agID, failJobID, claimedFail.Attempt)
+
+		err = db.CompleteAgentJob(ctx, agID, failJobID, claimedFail.Attempt, "failed", "executor_error")
+		if err != nil {
+			t.Fatalf("CompleteAgentJob failure failed: %v", err)
+		}
+
+		err = db.CompleteAgentJob(ctx, agID, failJobID, claimedFail.Attempt, "failed", "executor_error")
+		if err != nil {
+			t.Fatalf("CompleteAgentJob failure exact replay failed: %v", err)
+		}
+
+		if err := db.CompleteAgentJob(ctx, agID, failJobID, claimedFail.Attempt, "succeeded", "arbitrary"); !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict for succeeded with failure code, got %v", err)
+		}
+		if err := db.CompleteAgentJob(ctx, agID, failJobID, claimedFail.Attempt, "failed", "arbitrary"); !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict for failed with arbitrary failure code, got %v", err)
+		}
+		if err := db.CompleteAgentJob(ctx, agID, failJobID, claimedFail.Attempt, "invalid_outcome", ""); !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict for invalid outcome, got %v", err)
+		}
+
+		_ = jSuccess
+		_ = jFail
+	})
+
+	t.Run("complete_agent_job_late_deadline_transition_unknown", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-late-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var kh [32]byte
+		_, _ = rand.Read(kh[:])
+		jLate, _, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+		if err != nil {
+			t.Fatalf("failed to create job: %v", err)
+		}
+		claimed, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimed == nil {
+			t.Fatalf("failed to claim job: %v", err)
+		}
+		lateJobID, _ := uuid.Parse(claimed.JobID)
+		if err := db.StartAgentJob(ctx, agID, lateJobID, claimed.Attempt); err != nil {
+			t.Fatalf("failed to start job: %v", err)
+		}
+
+		_, err = db.pool.Exec(ctx, `
+			UPDATE stackpilot.jobs
+			SET execution_deadline_at = clock_timestamp() - interval '1 second'
+			WHERE id = $1
+		`, lateJobID)
+		if err != nil {
+			t.Fatalf("failed to expire deadline: %v", err)
+		}
+
+		err = db.CompleteAgentJob(ctx, agID, lateJobID, claimed.Attempt, "succeeded", "")
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict on late completion, got %v", err)
+		}
+
+		reconciled, err := db.GetJobByID(ctx, lateJobID)
+		if err != nil {
+			t.Fatalf("GetJobByID failed: %v", err)
+		}
+		if reconciled.State != job.StateUnknown {
+			t.Fatalf("expected state unknown for late completion, got %s", reconciled.State)
+		}
+		if reconciled.FailureCode == nil || *reconciled.FailureCode != "execution_timeout" {
+			t.Fatalf("expected failure code execution_timeout, got %v", reconciled.FailureCode)
+		}
+
+		err = db.CompleteAgentJob(ctx, agID, lateJobID, claimed.Attempt, "succeeded", "")
+		if !errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected ErrJobConflict on second completion for unknown job, got %v", err)
+		}
+
+		_ = jLate
+	})
+
+	t.Run("complete_agent_job_running_null_deadline_fail_closed", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-null-dl-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var kh [32]byte
+		_, _ = rand.Read(kh[:])
+		jNull, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+		if err != nil || !isNew {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		claimed, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimed == nil {
+			t.Fatalf("ClaimNextAgentJob failed: %v", err)
+		}
+		nullJobID, _ := uuid.Parse(claimed.JobID)
+		if err := db.StartAgentJob(ctx, agID, nullJobID, claimed.Attempt); err != nil {
+			t.Fatalf("StartAgentJob failed: %v", err)
+		}
+
+		// Corrupt row by clearing execution_deadline_at while state is running
+		_, err = db.pool.Exec(ctx, `
+			UPDATE stackpilot.jobs
+			SET execution_deadline_at = NULL
+			WHERE id = $1
+		`, nullJobID)
+		if err != nil {
+			t.Fatalf("failed to set execution_deadline_at to NULL: %v", err)
+		}
+
+		// CompleteAgentJob MUST return a safe backend corruption error, NOT ErrJobConflict
+		err = db.CompleteAgentJob(ctx, agID, nullJobID, claimed.Attempt, "succeeded", "")
+		if err == nil {
+			t.Fatal("expected error on CompleteAgentJob with NULL execution_deadline_at, got nil")
+		}
+		if errors.Is(err, job.ErrJobConflict) {
+			t.Fatalf("expected backend corruption error, not ErrJobConflict: %v", err)
+		}
+
+		// State must remain running, no transition accepted, and no new events written
+		var st string
+		var fc *string
+		err = db.pool.QueryRow(ctx, "SELECT state, failure_code FROM stackpilot.jobs WHERE id = $1", nullJobID).Scan(&st, &fc)
+		if err != nil {
+			t.Fatalf("failed to query job state: %v", err)
+		}
+		if st != string(job.StateRunning) {
+			t.Fatalf("expected state to remain running, got %s", st)
+		}
+
+		events, err := db.ListJobEvents(ctx, nullJobID, 10)
+		if err != nil {
+			t.Fatalf("failed to list job events: %v", err)
+		}
+		if len(events) != 3 {
+			t.Fatalf("expected exactly 3 events (no terminal event written), got %d", len(events))
+		}
+
+		_ = jNull
+	})
+
+	t.Run("claim_next_agent_job_corrupt_attempt_fail_closed", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-corrupt-att-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var kh [32]byte
+		_, _ = rand.Read(kh[:])
+		jCorrupt, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+		if err != nil || !isNew {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+
+		// Corrupt attempt count on queued row to MaxDispatchAttempts (5)
+		_, err = db.pool.Exec(ctx, "UPDATE stackpilot.jobs SET attempt = 5 WHERE id = $1", jCorrupt.ID)
+		if err != nil {
+			t.Fatalf("failed to corrupt attempt: %v", err)
+		}
+
+		// ClaimNextAgentJob must reject corrupt attempt with internal error before writing attempt 6
+		_, err = db.ClaimNextAgentJob(ctx, agID)
+		if err == nil {
+			t.Fatal("expected error on claiming job with attempt >= MaxDispatchAttempts, got nil")
+		}
+
+		_ = jCorrupt
+	})
+
+	t.Run("event_order_and_count_lifecycle", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-evt-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var kh [32]byte
+		_, _ = rand.Read(kh[:])
+
+		j, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+		if err != nil || !isNew {
+			t.Fatalf("CreateJob failed: %v (isNew=%v)", err, isNew)
+		}
+
+		claimed, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimed == nil {
+			t.Fatalf("ClaimNextAgentJob failed: %v", err)
+		}
+		jobID, _ := uuid.Parse(claimed.JobID)
+
+		if err := db.StartAgentJob(ctx, agID, jobID, claimed.Attempt); err != nil {
+			t.Fatalf("StartAgentJob failed: %v", err)
+		}
+
+		if err := db.CompleteAgentJob(ctx, agID, jobID, claimed.Attempt, "succeeded", ""); err != nil {
+			t.Fatalf("CompleteAgentJob failed: %v", err)
+		}
+
+		// Exact completion replay must NOT create another terminal event
+		if err := db.CompleteAgentJob(ctx, agID, jobID, claimed.Attempt, "succeeded", ""); err != nil {
+			t.Fatalf("CompleteAgentJob replay failed: %v", err)
+		}
+
+		events, err := db.ListJobEvents(ctx, jobID, 10)
+		if err != nil {
+			t.Fatalf("ListJobEvents failed: %v", err)
+		}
+
+		if len(events) != 4 {
+			t.Fatalf("expected exactly 4 events for succeeded lifecycle, got %d", len(events))
+		}
+
+		expectedTypes := []string{
+			job.EventJobCreated,
+			job.EventJobDispatched,
+			job.EventJobStarted,
+			job.EventJobSucceeded,
+		}
+		for i, expected := range expectedTypes {
+			if events[i].EventType != expected {
+				t.Fatalf("event %d: expected %s, got %s", i, expected, events[i].EventType)
+			}
+			if i > 0 {
+				if events[i].OccurredAt.Before(events[i-1].OccurredAt) {
+					t.Fatalf("events not ordered by occurred_at ASC: index %d (%v) before %d (%v)",
+						i, events[i].OccurredAt, i-1, events[i-1].OccurredAt)
+				}
+			}
+		}
+
+		_ = j
+	})
+
+	t.Run("expiry_attempts_1_through_5_separately", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-exp-seq-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		for att := 1; att <= 4; att++ {
+			var kh [32]byte
+			_, _ = rand.Read(kh[:])
+			j, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh)
+			if err != nil || !isNew {
+				t.Fatalf("attempt %d: CreateJob failed: %v", att, err)
+			}
+
+			claimed, err := db.ClaimNextAgentJob(ctx, agID)
+			if err != nil || claimed == nil {
+				t.Fatalf("attempt %d: ClaimNextAgentJob failed: %v", att, err)
+			}
+			jobID, _ := uuid.Parse(claimed.JobID)
+
+			_, err = db.pool.Exec(ctx, `
+				UPDATE stackpilot.jobs
+				SET attempt = $2,
+				    dispatch_expires_at = clock_timestamp() - interval '10 seconds'
+				WHERE id = $1
+			`, jobID, att)
+			if err != nil {
+				t.Fatalf("attempt %d: update failed: %v", att, err)
+			}
+
+			reconciled, err := db.GetJobByID(ctx, jobID)
+			if err != nil {
+				t.Fatalf("attempt %d: GetJobByID failed: %v", att, err)
+			}
+			if reconciled.State != job.StateQueued {
+				t.Fatalf("attempt %d: expected state queued after expiry, got %s", att, reconciled.State)
+			}
+
+			_, _ = db.pool.Exec(ctx, "DELETE FROM stackpilot.jobs WHERE id = $1", jobID)
+			_ = j
+		}
+
+		var kh5 [32]byte
+		_, _ = rand.Read(kh5[:])
+		j5, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, kh5)
+		if err != nil || !isNew {
+			t.Fatalf("attempt 5: CreateJob failed: %v", err)
+		}
+
+		claimed5, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimed5 == nil {
+			t.Fatalf("attempt 5: ClaimNextAgentJob failed: %v", err)
+		}
+		jobID5, _ := uuid.Parse(claimed5.JobID)
+
+		_, err = db.pool.Exec(ctx, `
+			UPDATE stackpilot.jobs
+			SET attempt = 5,
+			    dispatch_expires_at = clock_timestamp() - interval '10 seconds'
+			WHERE id = $1
+		`, jobID5)
+		if err != nil {
+			t.Fatalf("attempt 5: update failed: %v", err)
+		}
+
+		reconciled5, err := db.GetJobByID(ctx, jobID5)
+		if err != nil {
+			t.Fatalf("attempt 5: GetJobByID failed: %v", err)
+		}
+		if reconciled5.State != job.StateFailed {
+			t.Fatalf("attempt 5: expected state failed, got %s", reconciled5.State)
+		}
+		if reconciled5.FailureCode == nil || *reconciled5.FailureCode != "dispatch_exhausted" {
+			t.Fatalf("attempt 5: expected failure code dispatch_exhausted, got %v", reconciled5.FailureCode)
+		}
+
+		_ = j5
+	})
+
+	t.Run("expiration_reconciliation_running_deadline", func(t *testing.T) {
+		op := createTestOp(fmt.Sprintf("op-run-exp-%s", uuid.New().String()[:8]), operator.RoleAdmin)
+		ag := createTestAgent()
+
+		opID, _ := uuid.Parse(op.ID)
+		agID, _ := uuid.Parse(ag.ID)
+
+		var khUnk [32]byte
+		_, _ = rand.Read(khUnk[:])
+		jUnknown, isNew, err := db.CreateJob(ctx, opID, agID, job.ActionAgentPing, khUnk)
+		if err != nil || !isNew {
+			t.Fatalf("CreateJob failed: %v", err)
+		}
+		claimedUnk, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil || claimedUnk == nil {
+			t.Fatalf("ClaimNextAgentJob failed: %v", err)
+		}
+		claimedUnkID, _ := uuid.Parse(claimedUnk.JobID)
+		if err := db.StartAgentJob(ctx, agID, claimedUnkID, claimedUnk.Attempt); err != nil {
+			t.Fatalf("StartAgentJob failed: %v", err)
+		}
+
+		_, err = db.pool.Exec(ctx, `
+			UPDATE stackpilot.jobs
+			SET execution_deadline_at = clock_timestamp() - interval '10 seconds'
+			WHERE id = $1
+		`, claimedUnkID)
+		if err != nil {
+			t.Fatalf("failed to set execution_deadline_at in past: %v", err)
+		}
+
+		reconciledUnk, err := db.GetJobByID(ctx, claimedUnkID)
+		if err != nil {
+			t.Fatalf("GetJobByID failed: %v", err)
+		}
+		if reconciledUnk.State != job.StateUnknown {
+			t.Fatalf("expected state unknown, got %s", reconciledUnk.State)
+		}
+		if reconciledUnk.FailureCode == nil || *reconciledUnk.FailureCode != "execution_timeout" {
+			t.Fatalf("expected failure code execution_timeout, got %v", reconciledUnk.FailureCode)
+		}
+
+		claimAfterUnk, err := db.ClaimNextAgentJob(ctx, agID)
+		if err != nil {
+			t.Fatalf("ClaimNextAgentJob failed: %v", err)
+		}
+		if claimAfterUnk != nil {
+			t.Fatalf("expected nil claim after unknown job, got %v", claimAfterUnk)
+		}
+
+		_ = jUnknown
+	})
 }

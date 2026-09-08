@@ -278,19 +278,32 @@ func (db *DB) FindAgentByPublicKey(ctx context.Context, publicKey [32]byte) (*en
 	}, nil
 }
 
-// RecordAgentHeartbeat updates the agent's presence timestamp to database now() and records protocol_version.
-func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error) {
+// RecordAgentHeartbeat updates the agent's presence timestamp to database now(), records protocol_version,
+// and returns a boolean hint indicating whether the agent has active jobs (queued, dispatched, running).
+func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, bool, error) {
 	if db.pool == nil {
-		return nil, fmt.Errorf("database pool is not initialized")
+		return nil, false, fmt.Errorf("database pool is not initialized")
 	}
 
 	const query = `
-		UPDATE stackpilot.agents
-		SET
-			last_seen_at = now(),
-			protocol_version = $2
-		WHERE public_key = $1
-		RETURNING id::text, created_at, last_seen_at, protocol_version
+		WITH updated AS (
+			UPDATE stackpilot.agents
+			SET
+				last_seen_at = now(),
+				protocol_version = $2
+			WHERE public_key = $1
+			RETURNING id, created_at, last_seen_at, protocol_version
+		)
+		SELECT
+			u.id::text,
+			u.created_at,
+			u.last_seen_at,
+			u.protocol_version,
+			EXISTS (
+				SELECT 1 FROM stackpilot.jobs j
+				WHERE j.agent_id = u.id AND j.state IN ('queued', 'dispatched', 'running')
+			) AS has_active_jobs
+		FROM updated u;
 	`
 
 	var (
@@ -298,14 +311,15 @@ func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, prot
 		createdAt              time.Time
 		lastSeenAt             *time.Time
 		protocolVersionScanned *int
+		hasActiveJobs          bool
 	)
 
-	err := db.pool.QueryRow(ctx, query, publicKey[:], protocolVersion).Scan(&id, &createdAt, &lastSeenAt, &protocolVersionScanned)
+	err := db.pool.QueryRow(ctx, query, publicKey[:], protocolVersion).Scan(&id, &createdAt, &lastSeenAt, &protocolVersionScanned, &hasActiveJobs)
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return nil, enrollment.ErrAgentNotFound
+			return nil, false, enrollment.ErrAgentNotFound
 		}
-		return nil, fmt.Errorf("failed to record agent heartbeat: %w", sanitizeError(err))
+		return nil, false, fmt.Errorf("failed to record agent heartbeat: %w", sanitizeError(err))
 	}
 
 	return &enrollment.AgentRecord{
@@ -314,7 +328,7 @@ func (db *DB) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, prot
 		CreatedAt:       createdAt,
 		LastSeenAt:      lastSeenAt,
 		ProtocolVersion: protocolVersionScanned,
-	}, nil
+	}, hasActiveJobs, nil
 }
 
 // RecordAgentInventory updates or inserts the agent's current host inventory snapshot in one database round trip.
@@ -810,6 +824,7 @@ func (db *DB) RecordAndListAuditEvents(ctx context.Context, actorOperatorID stri
 			action,
 			target_operator_id::text,
 			target_username,
+			target_job_id::text,
 			outcome
 		FROM stackpilot.operator_audit_events
 		ORDER BY occurred_at DESC, id DESC
@@ -825,7 +840,7 @@ func (db *DB) RecordAndListAuditEvents(ctx context.Context, actorOperatorID stri
 	for rows.Next() {
 		var ev operator.AuditEventRecord
 		var actStr, outStr string
-		var actorID, targetID *string
+		var actorID, targetID, targetJobID *string
 		if err := rows.Scan(
 			&ev.ID,
 			&ev.OccurredAt,
@@ -834,12 +849,14 @@ func (db *DB) RecordAndListAuditEvents(ctx context.Context, actorOperatorID stri
 			&actStr,
 			&targetID,
 			&ev.TargetUsername,
+			&targetJobID,
 			&outStr,
 		); err != nil {
 			return nil, fmt.Errorf("failed to scan audit event: %w", sanitizeError(err))
 		}
 		ev.ActorOperatorID = actorID
 		ev.TargetOperatorID = targetID
+		ev.TargetJobID = targetJobID
 		ev.Action = operator.AuditAction(actStr)
 		ev.Outcome = operator.AuditOutcome(outStr)
 		events = append(events, ev)

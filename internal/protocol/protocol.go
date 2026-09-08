@@ -6,10 +6,12 @@ import (
 	"strings"
 	"unicode"
 	"unicode/utf8"
+
+	"stackpilot/internal/job"
 )
 
 // CurrentVersion is the currently supported Agent protocol version.
-const CurrentVersion = 1
+const CurrentVersion = 2
 
 // HeartbeatEndpointPath is the HTTP path for Agent presence heartbeat requests on the remote TLS listener.
 const HeartbeatEndpointPath = "/api/v1/agent/heartbeat"
@@ -19,6 +21,41 @@ const InventoryEndpointPath = "/api/v1/agent/inventory"
 
 // TelemetryEndpointPath is the HTTP path for Agent runtime telemetry reports on the remote TLS listener.
 const TelemetryEndpointPath = "/api/v1/agent/telemetry"
+
+// AgentJobStartEndpointPath is the HTTP path for Agent job start execution authorization on the remote TLS listener.
+const AgentJobStartEndpointPath = "/api/v1/agent/job/start"
+
+// AgentJobCompleteEndpointPath is the HTTP path for Agent job completion reporting on the remote TLS listener.
+const AgentJobCompleteEndpointPath = "/api/v1/agent/job/complete"
+
+// JobAssignment defines the assigned job payload delivered via heartbeat response.
+type JobAssignment struct {
+	JobID   string `json:"job_id"`
+	Attempt int    `json:"attempt"`
+	Action  string `json:"action"`
+}
+
+// HeartbeatResponse defines the JSON payload returned to an Agent upon heartbeat when a job is assigned.
+type HeartbeatResponse struct {
+	ProtocolVersion int            `json:"protocol_version"`
+	Job             *JobAssignment `json:"job,omitempty"`
+}
+
+// JobStartRequest defines the JSON payload sent by an Agent to request authorization to execute an assigned job.
+type JobStartRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	JobID           string `json:"job_id"`
+	Attempt         int    `json:"attempt"`
+}
+
+// JobCompleteRequest defines the JSON payload sent by an Agent to report the terminal result of a job.
+type JobCompleteRequest struct {
+	ProtocolVersion int    `json:"protocol_version"`
+	JobID           string `json:"job_id"`
+	Attempt         int    `json:"attempt"`
+	Outcome         string `json:"outcome"`
+	FailureCode     string `json:"failure_code,omitempty"`
+}
 
 // HeartbeatRequest defines the JSON payload sent by an Agent during presence heartbeats.
 type HeartbeatRequest struct {
@@ -170,6 +207,75 @@ func ValidateTelemetryRequest(req *TelemetryRequest) error {
 	}
 	if req.SampleWindowMS < 1 || req.SampleWindowMS > 300000 {
 		return errors.New("invalid sample_window_ms: must be between 1 and 300000")
+	}
+	return nil
+}
+
+// ValidateJobStartRequest validates the wire invariants of a JobStartRequest.
+func ValidateJobStartRequest(req *JobStartRequest) error {
+	if req == nil {
+		return errors.New("job start request is nil")
+	}
+	if req.ProtocolVersion <= 0 {
+		return errors.New("invalid protocol version")
+	}
+	if req.ProtocolVersion != CurrentVersion {
+		return errors.New("unsupported protocol version")
+	}
+	if _, err := job.ValidateCanonicalUUID(req.JobID); err != nil {
+		return fmt.Errorf("invalid job_id: %w", err)
+	}
+	if req.Attempt < 1 || req.Attempt > job.MaxDispatchAttempts {
+		return fmt.Errorf("attempt out of range: must be between 1 and %d", job.MaxDispatchAttempts)
+	}
+	return nil
+}
+
+// ValidateJobCompleteRequest validates the wire invariants of a JobCompleteRequest.
+func ValidateJobCompleteRequest(req *JobCompleteRequest) error {
+	if req == nil {
+		return errors.New("job complete request is nil")
+	}
+	if req.ProtocolVersion <= 0 {
+		return errors.New("invalid protocol version")
+	}
+	if req.ProtocolVersion != CurrentVersion {
+		return errors.New("unsupported protocol version")
+	}
+	if _, err := job.ValidateCanonicalUUID(req.JobID); err != nil {
+		return fmt.Errorf("invalid job_id: %w", err)
+	}
+	if req.Attempt < 1 || req.Attempt > job.MaxDispatchAttempts {
+		return fmt.Errorf("attempt out of range: must be between 1 and %d", job.MaxDispatchAttempts)
+	}
+	switch req.Outcome {
+	case "succeeded":
+		if req.FailureCode != "" {
+			return errors.New("failure_code must be empty for succeeded outcome")
+		}
+	case "failed":
+		if req.FailureCode != string(job.FailureCodeExecutorError) {
+			return fmt.Errorf("failed outcome requires failure_code=%q", job.FailureCodeExecutorError)
+		}
+	default:
+		return fmt.Errorf("invalid outcome: %q", req.Outcome)
+	}
+	return nil
+}
+
+// ValidateJobAssignment validates that an assigned job from the controller conforms to invariant constraints.
+func ValidateJobAssignment(jobAssignment *JobAssignment) error {
+	if jobAssignment == nil {
+		return errors.New("job assignment is nil")
+	}
+	if _, err := job.ValidateCanonicalUUID(jobAssignment.JobID); err != nil {
+		return fmt.Errorf("invalid job_id: %w", err)
+	}
+	if jobAssignment.Attempt < 1 || jobAssignment.Attempt > job.MaxDispatchAttempts {
+		return fmt.Errorf("attempt out of range: must be between 1 and %d", job.MaxDispatchAttempts)
+	}
+	if job.Action(jobAssignment.Action) != job.ActionAgentPing {
+		return fmt.Errorf("invalid action: %q", jobAssignment.Action)
 	}
 	return nil
 }

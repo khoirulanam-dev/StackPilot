@@ -5,17 +5,31 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.10 stage (Operator Authentication, RBAC & Audit Foundation). It is pre-release and **NOT** production-ready.
+StackPilot is currently in the M0.11 stage (Job & Typed Action Engine). It is pre-release and **NOT** production-ready.
+
+Job & Typed Action Engine:
+- Typed action domain: `agent.ping` ONLY
+- Strict typed action boundary: no arbitrary commands, no shell strings, no argv/args arrays, no generic payload/JSONB, no subprocesses (`os/exec`)
+- Persistent jobs with PostgreSQL-backed state machine: `queued`, `dispatched`, `running`, `succeeded`, `failed`, `unknown`
+- Heartbeat-carried job assignment: idle Agent has no extra polling loop, ticker, or worker pool (assignments delivered via existing heartbeat HTTP responses)
+- At-most-once execution contract: receiving a job does not authorize execution; Agent must successfully obtain HTTP 204 from `/api/v1/agent/job/start` via an atomic, non-idempotent transition
+- Completion idempotency: terminal outcome reporting (`succeeded`, `failed` with `executor_error`) via `/api/v1/agent/job/complete` is safe for replay
+- Dispatch leasing: 30-second lease with bounded retry (max 5 dispatch attempts before failing with `dispatch_exhausted`)
+- Execution deadline: 60-second result deadline; expired running jobs transition to `unknown` with `execution_timeout` (never automatically retried)
+- Bounded concurrency: max 1 in-flight job (`dispatched` or `running`) per Agent enforced by partial unique index; max 64 active jobs per Agent
+- Append-only job event history: `job.created`, `job.dispatched`, `job.requeued`, `job.started`, `job.succeeded`, `job.failed`, `job.unknown`
+- Operator job RBAC: `jobs.read` permission for viewing jobs and events; `operations.execute` for submitting jobs with `Idempotency-Key` header (scoped per operator)
+- Protocol version: upgraded to version 2
 
 Operator Security Boundary:
 - Operator identity with secure password hashing (Argon2id: memory=32MiB, iterations=3, parallelism=1)
 - Operator bootstrap CLI with password via `--password-stdin`
 - Three typed operator roles: `viewer`, `operator`, `admin`
-- Explicit RBAC permission matrix (`servers.read`, `operations.execute`, `operators.manage`, `audit.read`)
+- Explicit RBAC permission matrix (`servers.read`, `jobs.read`, `operations.execute`, `operators.manage`, `audit.read`)
 - Opaque random session tokens (`sp_session_...`) stored only as SHA-256 hashes
 - Local-only loopback HTTP operator API (`127.0.0.1` / `[::1]`)
 - Session management: 12-hour absolute lifetime, max 8 active sessions per operator
-- Immutable, append-only operator audit log (`operator.created`, `operator.login`, `operator.logout`, `operator.audit.read`)
+- Immutable, append-only operator audit log (`operator.created`, `operator.login`, `operator.logout`, `operator.audit.read`, `job.created`)
 - Privileged admin-only audit read endpoint with bounded pagination (`limit` 1..200, default 100)
 
 Collected server inventory (current snapshot only):
@@ -34,17 +48,13 @@ Collected runtime telemetry (current snapshot only):
 - Aggregate network receive / transmit byte counters (excluding `lo`)
 - Uptime seconds
 
-Telemetry behavior:
-- Sequential execution within the existing Agent presence loop
-- Captured approximately at heartbeat cadence (~30 seconds with jitter)
-- Stores only the latest snapshot per Agent in `stackpilot.agent_telemetry` (one row per agent)
-- No historical time series yet
-
 Strict boundaries:
 - Pre-release and not production-ready
 - No UI, web control plane, or dashboards yet
 - No SSO, OIDC, SAML, LDAP, or MFA yet
-- No server operations, job execution, or remote shell yet
+- No real server operations yet
+- No privileged execution yet
+- No remote shell or arbitrary command execution
 - No application orchestration yet
 
 ## Development

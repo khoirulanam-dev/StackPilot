@@ -13,6 +13,7 @@ import (
 	"encoding/json"
 	"encoding/pem"
 	"errors"
+	"fmt"
 	"io"
 	"log/slog"
 	"math/big"
@@ -26,8 +27,11 @@ import (
 	"testing"
 	"time"
 
+	"github.com/google/uuid"
+
 	"stackpilot/internal/agent"
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/job"
 	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
 )
@@ -86,7 +90,7 @@ func (f *fakeAuthBackend) FindAgentByPublicKey(ctx context.Context, publicKey [3
 	return nil, enrollment.ErrAgentNotFound
 }
 
-func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, error) {
+func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [32]byte, protocolVersion int) (*enrollment.AgentRecord, bool, error) {
 	f.mu.Lock()
 	defer f.mu.Unlock()
 
@@ -94,7 +98,7 @@ func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [3
 	f.lastProtocolVersion = protocolVersion
 
 	if f.heartbeatErr != nil {
-		return nil, f.heartbeatErr
+		return nil, false, f.heartbeatErr
 	}
 
 	if f.agents != nil {
@@ -103,10 +107,10 @@ func (f *fakeAuthBackend) RecordAgentHeartbeat(ctx context.Context, publicKey [3
 			pv := protocolVersion
 			rec.LastSeenAt = &now
 			rec.ProtocolVersion = &pv
-			return rec, nil
+			return rec, false, nil
 		}
 	}
-	return nil, enrollment.ErrAgentNotFound
+	return nil, false, enrollment.ErrAgentNotFound
 }
 
 func (f *fakeAuthBackend) RecordAgentInventory(ctx context.Context, publicKey [32]byte, req *protocol.InventoryRequest) error {
@@ -172,6 +176,34 @@ func (f *fakeAuthBackend) RevokeOperatorSession(ctx context.Context, sessionID s
 
 func (f *fakeAuthBackend) RecordAndListAuditEvents(ctx context.Context, actorOperatorID string, actorUsername string, limit int) ([]operator.AuditEventRecord, error) {
 	return []operator.AuditEventRecord{}, nil
+}
+
+func (f *fakeAuthBackend) CreateJob(ctx context.Context, operatorID uuid.UUID, agentID uuid.UUID, action job.Action, idempotencyKeyHash [32]byte) (*job.Job, bool, error) {
+	return nil, false, errors.New("unimplemented in fakeAuthBackend")
+}
+
+func (f *fakeAuthBackend) GetJobByID(ctx context.Context, jobID uuid.UUID) (*job.Job, error) {
+	return nil, job.ErrJobNotFound
+}
+
+func (f *fakeAuthBackend) ListJobs(ctx context.Context, limit int, agentID *uuid.UUID, state *job.State) ([]job.Job, error) {
+	return []job.Job{}, nil
+}
+
+func (f *fakeAuthBackend) ListJobEvents(ctx context.Context, jobID uuid.UUID, limit int) ([]job.JobEvent, error) {
+	return []job.JobEvent{}, nil
+}
+
+func (f *fakeAuthBackend) ClaimNextAgentJob(ctx context.Context, agentID uuid.UUID) (*protocol.JobAssignment, error) {
+	return nil, nil
+}
+
+func (f *fakeAuthBackend) StartAgentJob(ctx context.Context, agentID uuid.UUID, jobID uuid.UUID, attempt int) error {
+	return nil
+}
+
+func (f *fakeAuthBackend) CompleteAgentJob(ctx context.Context, agentID uuid.UUID, jobID uuid.UUID, attempt int, outcome string, failureCode string) error {
+	return nil
 }
 
 func helperGenerateEd25519Cert(t *testing.T, notBefore, notAfter time.Time, extKeyUsage []x509.ExtKeyUsage, cn string, sanDNS []string) (ed25519.PublicKey, ed25519.PrivateKey, *x509.Certificate) {
@@ -749,7 +781,7 @@ func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
 		},
 	}
 
-	validBody := `{"protocol_version": 1}`
+	validBody := fmt.Sprintf(`{"protocol_version": %d}`, protocol.CurrentVersion)
 
 	// 1. Plaintext POST heartbeat -> TLS rejection (400)
 	t.Run("plaintext_post_heartbeat_rejected", func(t *testing.T) {
@@ -863,8 +895,8 @@ func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
 		}
 	})
 
-	// 9. Valid cert + protocol 1 -> 204
-	t.Run("valid_cert_and_protocol_1_succeeds", func(t *testing.T) {
+	// 9. Valid cert + current protocol -> 204
+	t.Run("valid_cert_and_protocol_succeeds", func(t *testing.T) {
 		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(validBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
@@ -883,14 +915,14 @@ func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
 		if backend.lastHeartbeatKey != keyA {
 			t.Errorf("backend did not receive expected public key")
 		}
-		if backend.lastProtocolVersion != 1 {
-			t.Errorf("backend did not receive protocol_version 1")
+		if backend.lastProtocolVersion != protocol.CurrentVersion {
+			t.Errorf("backend did not receive protocol_version %d", protocol.CurrentVersion)
 		}
 	})
 
 	// 10. Unsupported protocol version -> 409
 	t.Run("unsupported_protocol_version_rejected", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(`{"protocol_version": 2}`))
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(fmt.Sprintf(`{"protocol_version": %d}`, protocol.CurrentVersion+1)))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
 		rec := httptest.NewRecorder()
@@ -906,7 +938,7 @@ func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
 
 	// 11. Unknown JSON field -> 400
 	t.Run("unknown_json_field_rejected", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra": "field"}`))
+		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(fmt.Sprintf(`{"protocol_version": %d, "extra": "field"}`, protocol.CurrentVersion)))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
 		rec := httptest.NewRecorder()
@@ -919,7 +951,7 @@ func TestRemoteHandler_HeartbeatEndpoint(t *testing.T) {
 
 	// 12. Oversized body -> 400
 	t.Run("oversized_body_rejected", func(t *testing.T) {
-		oversized := `{"protocol_version": 1, "padding": "` + strings.Repeat("x", 2000) + `"}`
+		oversized := fmt.Sprintf(`{"protocol_version": %d, "padding": "%s"}`, protocol.CurrentVersion, strings.Repeat("x", 2000))
 		req := httptest.NewRequest(http.MethodPost, protocol.HeartbeatEndpointPath, strings.NewReader(oversized))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
@@ -1146,8 +1178,8 @@ func TestRealTLSHeartbeat_E2E(t *testing.T) {
 	if backend.lastHeartbeatKey != key32 {
 		t.Errorf("backend received key mismatch: got %x, want %x", backend.lastHeartbeatKey, key32)
 	}
-	if backend.lastProtocolVersion != 1 {
-		t.Errorf("backend received protocol version %d, want 1", backend.lastProtocolVersion)
+	if backend.lastProtocolVersion != protocol.CurrentVersion {
+		t.Errorf("backend received protocol version %d, want %d", backend.lastProtocolVersion, protocol.CurrentVersion)
 	}
 	if backend.agents[key32].LastSeenAt == nil {
 		t.Fatal("backend record LastSeenAt was not updated")
@@ -1366,7 +1398,7 @@ func TestRemoteHandler_InventoryEndpoint(t *testing.T) {
 		backend.lastInventoryKey = [32]byte{}
 		backend.lastInventoryReq = nil
 
-		rawInvalidUTF8Body := []byte(`{"protocol_version":1,"hostname":"valid-node","os_id":"ubuntu","os_name":"Ubuntu` + "\xff" + `Linux","os_version":"24.04","kernel_release":"6.8.0","architecture":"amd64","cpu_logical_cores":4,"memory_total_bytes":8192000}`)
+		rawInvalidUTF8Body := []byte(fmt.Sprintf(`{"protocol_version":%d,"hostname":"valid-node","os_id":"ubuntu","os_name":"Ubuntu`+"\xff"+`Linux","os_version":"24.04","kernel_release":"6.8.0","architecture":"amd64","cpu_logical_cores":4,"memory_total_bytes":8192000}`, protocol.CurrentVersion))
 
 		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(rawInvalidUTF8Body))
 		req.Header.Set("Content-Type", "application/json")
@@ -1402,7 +1434,7 @@ func TestRemoteHandler_InventoryEndpoint(t *testing.T) {
 	})
 
 	t.Run("unknown_field", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra": "forbidden"}`))
+		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, strings.NewReader(fmt.Sprintf(`{"protocol_version": %d, "extra": "forbidden"}`, protocol.CurrentVersion)))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCertA}}
 		rec := httptest.NewRecorder()
@@ -1444,7 +1476,7 @@ func TestRemoteHandler_InventoryEndpoint(t *testing.T) {
 
 	t.Run("protocol_version_mismatch", func(t *testing.T) {
 		badReq := validReq
-		badReq.ProtocolVersion = 2
+		badReq.ProtocolVersion = protocol.CurrentVersion + 1
 		badBytes, _ := json.Marshal(badReq)
 
 		req := httptest.NewRequest(http.MethodPut, protocol.InventoryEndpointPath, bytes.NewReader(badBytes))
@@ -1932,7 +1964,7 @@ func TestRemoteHandler_AgentTelemetry(t *testing.T) {
 	})
 
 	t.Run("oversized_body_rejected", func(t *testing.T) {
-		largeBody := `{"protocol_version": 1, "cpu_usage_basis_points": 0, "padding": "` + strings.Repeat("a", 4096) + `"}`
+		largeBody := fmt.Sprintf(`{"protocol_version": %d, "cpu_usage_basis_points": 0, "padding": "%s"}`, protocol.CurrentVersion, strings.Repeat("a", 4096))
 		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(largeBody))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
@@ -1945,7 +1977,7 @@ func TestRemoteHandler_AgentTelemetry(t *testing.T) {
 	})
 
 	t.Run("raw_invalid_utf8_rejected", func(t *testing.T) {
-		rawInvalidUTF8 := []byte(`{"protocol_version": 1, "invalid": "` + "\xff\xfe\xfd" + `"}`)
+		rawInvalidUTF8 := []byte(fmt.Sprintf(`{"protocol_version": %d, "invalid": "\xff\xfe\xfd"}`, protocol.CurrentVersion))
 		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(rawInvalidUTF8))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
@@ -1970,7 +2002,7 @@ func TestRemoteHandler_AgentTelemetry(t *testing.T) {
 	})
 
 	t.Run("unknown_json_field_rejected", func(t *testing.T) {
-		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(`{"protocol_version": 1, "extra_field": "disallowed"}`))
+		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, strings.NewReader(fmt.Sprintf(`{"protocol_version": %d, "extra_field": "disallowed"}`, protocol.CurrentVersion)))
 		req.Header.Set("Content-Type", "application/json")
 		req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{certA}}
 		rec := httptest.NewRecorder()
@@ -2010,7 +2042,7 @@ func TestRemoteHandler_AgentTelemetry(t *testing.T) {
 
 	t.Run("protocol_version_mismatch_conflict", func(t *testing.T) {
 		badReq := validReq
-		badReq.ProtocolVersion = 2
+		badReq.ProtocolVersion = protocol.CurrentVersion + 1
 		badBytes, _ := json.Marshal(badReq)
 		req := httptest.NewRequest(http.MethodPut, protocol.TelemetryEndpointPath, bytes.NewReader(badBytes))
 		req.Header.Set("Content-Type", "application/json")
@@ -2315,4 +2347,82 @@ func TestRealTLSTelemetry_E2E(t *testing.T) {
 	if backend.lastTelemetryReq.SampleWindowMS != telemReq.SampleWindowMS {
 		t.Errorf("sample_window_ms mismatch: got %d, want %d", backend.lastTelemetryReq.SampleWindowMS, telemReq.SampleWindowMS)
 	}
+}
+
+func TestTrustDomain_Separation_M011(t *testing.T) {
+	logger := slog.New(slog.NewTextHandler(io.Discard, nil))
+	backend := &fakeAuthBackend{agents: make(map[[32]byte]*enrollment.AgentRecord)}
+	remoteHandler := newRemoteHandler(logger, backend, backend, backend)
+	localHandler := newHandler(logger, nil, backend, backend, backend)
+
+	pub, _, validCert := helperGenerateEd25519Cert(t, time.Now().Add(-1*time.Hour), time.Now().Add(1*time.Hour), []x509.ExtKeyUsage{x509.ExtKeyUsageClientAuth}, "agent-test", nil)
+	var pubKey [32]byte
+	copy(pubKey[:], pub)
+	backend.agents[pubKey] = &enrollment.AgentRecord{
+		ID:        uuid.Must(uuid.NewV7()).String(),
+		PublicKey: pubKey,
+		CreatedAt: time.Now().UTC(),
+	}
+
+	testJobID := uuid.Must(uuid.NewV7()).String()
+
+	t.Run("remote listener returns 404 for operator job routes even with valid client cert", func(t *testing.T) {
+		paths := []string{
+			"/api/v1/operator/jobs",
+			"/api/v1/operator/jobs/" + testJobID,
+			"/api/v1/operator/jobs/" + testJobID + "/events",
+		}
+		for _, p := range paths {
+			req := httptest.NewRequest(http.MethodGet, p, nil)
+			req.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{validCert}}
+			rec := httptest.NewRecorder()
+			remoteHandler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 on remote listener for %s, got %d", p, rec.Code)
+			}
+		}
+	})
+
+	t.Run("local listener returns 404 for agent job routes", func(t *testing.T) {
+		paths := []string{
+			"/api/v1/agent/job/start",
+			"/api/v1/agent/job/complete",
+		}
+		for _, p := range paths {
+			req := httptest.NewRequest(http.MethodPost, p, strings.NewReader("{}"))
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			localHandler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusNotFound {
+				t.Fatalf("expected 404 on local listener for %s, got %d", p, rec.Code)
+			}
+		}
+	})
+
+	t.Run("operator bearer token does not authenticate agent job endpoints on remote listener", func(t *testing.T) {
+		paths := []string{
+			"/api/v1/agent/job/start",
+			"/api/v1/agent/job/complete",
+		}
+		for _, p := range paths {
+			req := httptest.NewRequest(http.MethodPost, p, strings.NewReader(`{"protocol_version":2}`))
+			req.Header.Set("Authorization", "Bearer sp_session_mocktoken1234567890abcdef")
+			req.Header.Set("Content-Type", "application/json")
+			rec := httptest.NewRecorder()
+			remoteHandler.ServeHTTP(rec, req)
+			if rec.Code != http.StatusBadRequest {
+				t.Fatalf("expected 400 TLS required on remote listener without TLS, got %d", rec.Code)
+			}
+
+			reqTLS := httptest.NewRequest(http.MethodPost, p, strings.NewReader(`{"protocol_version":2}`))
+			reqTLS.TLS = &tls.ConnectionState{PeerCertificates: []*x509.Certificate{}}
+			reqTLS.Header.Set("Authorization", "Bearer sp_session_mocktoken1234567890abcdef")
+			reqTLS.Header.Set("Content-Type", "application/json")
+			recTLS := httptest.NewRecorder()
+			remoteHandler.ServeHTTP(recTLS, reqTLS)
+			if recTLS.Code != http.StatusUnauthorized {
+				t.Fatalf("expected 401 unauthorized on remote listener without client cert, got %d", recTLS.Code)
+			}
+		}
+	})
 }

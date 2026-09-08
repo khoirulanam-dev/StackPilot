@@ -56,6 +56,7 @@ func TestAuditActions_Constants(t *testing.T) {
 		ActionOperatorLogin:     "operator.login",
 		ActionOperatorLogout:    "operator.logout",
 		ActionOperatorAuditRead: "operator.audit.read",
+		ActionJobCreated:        "job.created",
 	}
 
 	for act, str := range expectedActions {
