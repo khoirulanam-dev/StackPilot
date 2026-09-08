@@ -15,11 +15,13 @@ import (
 	"mime"
 	"net"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 	"unicode/utf8"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
 )
 
@@ -38,9 +40,18 @@ type agentAuthenticator interface {
 	RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req *protocol.TelemetryRequest) error
 }
 
+type operatorBackend interface {
+	GetOperatorByUsername(ctx context.Context, username string) (*operator.OperatorRecord, error)
+	CreateOperatorSession(ctx context.Context, operatorID string, tokenHash [32]byte) (*operator.SessionRecord, error)
+	FindOperatorSessionByTokenHash(ctx context.Context, tokenHash [32]byte) (*operator.Principal, error)
+	RevokeOperatorSession(ctx context.Context, sessionID string, operatorID string, username string) error
+	RecordAndListAuditEvents(ctx context.Context, actorOperatorID string, actorUsername string, limit int) ([]operator.AuditEventRecord, error)
+}
+
 func writeJSON(w http.ResponseWriter, status int, data any) {
 	w.Header().Set("Content-Type", "application/json")
 	w.Header().Set("Cache-Control", "no-store")
+	w.Header().Set("X-Content-Type-Options", "nosniff")
 	w.WriteHeader(status)
 	_ = json.NewEncoder(w).Encode(data)
 }
@@ -148,7 +159,290 @@ func handleEnroll(w http.ResponseWriter, r *http.Request, registrar enrollmentRe
 	})
 }
 
-func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollmentRegistrar) http.Handler {
+func handleOperatorLogin(w http.ResponseWriter, r *http.Request, opBackend operatorBackend, limiter *operator.ConcurrencyLimiter, logger *slog.Logger) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	ct := r.Header.Get("Content-Type")
+	mediaType, params, err := mime.ParseMediaType(ct)
+	if err != nil || mediaType != "application/json" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+		return
+	}
+	if charset, ok := params["charset"]; ok && strings.ToLower(charset) != "utf-8" {
+		writeJSON(w, http.StatusUnsupportedMediaType, map[string]string{"error": "unsupported media type"})
+		return
+	}
+
+	limited := io.LimitReader(r.Body, 1025)
+	bodyBytes, err := io.ReadAll(limited)
+	if err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "failed to read request body"})
+		return
+	}
+	if len(bodyBytes) == 0 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "empty request body"})
+		return
+	}
+	if len(bodyBytes) > 1024 {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "request body too large"})
+		return
+	}
+
+	if !utf8.Valid(bodyBytes) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid request body"})
+		return
+	}
+
+	dec := json.NewDecoder(bytes.NewReader(bodyBytes))
+	dec.DisallowUnknownFields()
+	var req struct {
+		Username string `json:"username"`
+		Password string `json:"password"`
+	}
+	if err := dec.Decode(&req); err != nil {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "malformed request"})
+		return
+	}
+	if dec.More() {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trailing data in request body"})
+		return
+	}
+	var extra any
+	if err := dec.Decode(&extra); !errors.Is(err, io.EOF) {
+		writeJSON(w, http.StatusBadRequest, map[string]string{"error": "trailing data in request body"})
+		return
+	}
+
+	if limiter == nil {
+		limiter = operator.NewConcurrencyLimiter(2)
+	}
+	release, ok := limiter.TryAcquire()
+	if !ok {
+		w.Header().Set("Retry-After", "1")
+		writeJSON(w, http.StatusTooManyRequests, map[string]string{"error": "too many requests"})
+		return
+	}
+	defer release()
+
+	if opBackend == nil {
+		writeJSON(w, http.StatusServiceUnavailable, map[string]string{"error": "service unavailable"})
+		return
+	}
+
+	normUsername := operator.NormalizeUsername(req.Username)
+	dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	op, err := opBackend.GetOperatorByUsername(dbCtx, normUsername)
+	if err != nil {
+		if errors.Is(err, operator.ErrOperatorNotFound) {
+			operator.DummyPasswordDerivation(req.Password)
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		logger.Error("operator login query failure")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+	if op == nil {
+		logger.Error("operator lookup returned nil operator")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	if err := operator.VerifyPassword(op.PasswordHash, req.Password); err != nil || op.DisabledAt != nil {
+		writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+		return
+	}
+
+	rawToken, err := operator.GenerateSessionToken()
+	if err != nil {
+		logger.Error("failed to generate session token")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	tokenHash := operator.HashSessionToken(rawToken)
+	sessionRec, err := opBackend.CreateOperatorSession(dbCtx, op.ID, tokenHash)
+	if err != nil {
+		if errors.Is(err, operator.ErrAuthenticationFailed) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "invalid credentials"})
+			return
+		}
+		logger.Error("operator session persistence failure")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]any{
+		"token":      rawToken,
+		"expires_at": sessionRec.ExpiresAt.Format(time.RFC3339Nano),
+		"operator": map[string]string{
+			"id":       op.ID,
+			"username": op.Username,
+			"role":     string(op.Role),
+		},
+	})
+}
+
+func authenticateOperator(r *http.Request, opBackend operatorBackend, logger *slog.Logger) (*operator.Principal, int, string) {
+	if opBackend == nil {
+		return nil, http.StatusServiceUnavailable, "service unavailable"
+	}
+
+	authHeader := r.Header.Get("Authorization")
+	if authHeader == "" {
+		return nil, http.StatusUnauthorized, "authentication required"
+	}
+
+	parts := strings.SplitN(authHeader, " ", 2)
+	if len(parts) != 2 || parts[0] != "Bearer" || parts[1] == "" {
+		return nil, http.StatusUnauthorized, "authentication required"
+	}
+
+	rawToken := parts[1]
+	if err := operator.ValidateSessionToken(rawToken); err != nil {
+		return nil, http.StatusUnauthorized, "authentication required"
+	}
+
+	tokenHash := operator.HashSessionToken(rawToken)
+	dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	principal, err := opBackend.FindOperatorSessionByTokenHash(dbCtx, tokenHash)
+	if err != nil {
+		if errors.Is(err, operator.ErrAuthenticationFailed) {
+			return nil, http.StatusUnauthorized, "authentication required"
+		}
+		if logger != nil {
+			logger.Error("operator session lookup failure")
+		}
+		return nil, http.StatusInternalServerError, "internal server error"
+	}
+	// Security invariant: Defensive role validation fails closed if principal has unknown/corrupt role.
+	if principal == nil || !principal.Role.Valid() {
+		return nil, http.StatusUnauthorized, "authentication required"
+	}
+
+	return principal, http.StatusOK, ""
+}
+
+func handleOperatorMe(w http.ResponseWriter, r *http.Request, opBackend operatorBackend, logger *slog.Logger) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, status, errMsg := authenticateOperator(r, opBackend, logger)
+	if principal == nil {
+		writeJSON(w, status, map[string]string{"error": errMsg})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, map[string]string{
+		"id":                 principal.OperatorID,
+		"username":           principal.Username,
+		"role":               string(principal.Role),
+		"session_expires_at": principal.ExpiresAt.Format(time.RFC3339Nano),
+	})
+}
+
+func handleOperatorLogout(w http.ResponseWriter, r *http.Request, opBackend operatorBackend, logger *slog.Logger) {
+	if r.Method != http.MethodPost {
+		w.Header().Set("Allow", "POST")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, status, errMsg := authenticateOperator(r, opBackend, logger)
+	if principal == nil {
+		writeJSON(w, status, map[string]string{"error": errMsg})
+		return
+	}
+
+	dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	if err := opBackend.RevokeOperatorSession(dbCtx, principal.SessionID, principal.OperatorID, principal.Username); err != nil {
+		if errors.Is(err, operator.ErrSessionNotFound) {
+			writeJSON(w, http.StatusUnauthorized, map[string]string{"error": "authentication required"})
+			return
+		}
+		logger.Error("operator session revocation failure")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	w.Header().Set("Cache-Control", "no-store")
+	w.WriteHeader(http.StatusNoContent)
+}
+
+func handleOperatorAudit(w http.ResponseWriter, r *http.Request, opBackend operatorBackend, logger *slog.Logger) {
+	if r.Method != http.MethodGet {
+		w.Header().Set("Allow", "GET")
+		w.WriteHeader(http.StatusMethodNotAllowed)
+		return
+	}
+
+	principal, status, errMsg := authenticateOperator(r, opBackend, logger)
+	if principal == nil {
+		writeJSON(w, status, map[string]string{"error": errMsg})
+		return
+	}
+
+	if !principal.Role.HasPermission(operator.PermissionAuditRead) {
+		writeJSON(w, http.StatusForbidden, map[string]string{"error": "forbidden"})
+		return
+	}
+
+	query := r.URL.Query()
+	for k := range query {
+		if k != "limit" {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "unknown query parameter"})
+			return
+		}
+	}
+
+	limit := 100
+	if query.Has("limit") {
+		var err error
+		limit, err = strconv.Atoi(query.Get("limit"))
+		if err != nil || limit < 1 || limit > 200 {
+			writeJSON(w, http.StatusBadRequest, map[string]string{"error": "invalid limit query parameter (must be 1..200)"})
+			return
+		}
+	}
+
+	dbCtx, cancel := context.WithTimeout(r.Context(), 5*time.Second)
+	defer cancel()
+
+	events, err := opBackend.RecordAndListAuditEvents(dbCtx, principal.OperatorID, principal.Username, limit)
+	if err != nil {
+		logger.Error("operator audit query failure")
+		writeJSON(w, http.StatusInternalServerError, map[string]string{"error": "internal server error"})
+		return
+	}
+
+	writeJSON(w, http.StatusOK, events)
+}
+
+func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollmentRegistrar, opBackends ...operatorBackend) http.Handler {
+	var opBackend operatorBackend
+	if len(opBackends) > 0 {
+		opBackend = opBackends[0]
+	} else if b, ok := registrar.(operatorBackend); ok {
+		opBackend = b
+	} else if b, ok := checker.(operatorBackend); ok {
+		opBackend = b
+	}
+
+	loginLimiter := operator.NewConcurrencyLimiter(2)
+
 	mux := http.NewServeMux()
 
 	mux.HandleFunc("/healthz", func(w http.ResponseWriter, r *http.Request) {
@@ -200,6 +494,22 @@ func newHandler(logger *slog.Logger, checker readinessChecker, registrar enrollm
 
 	mux.HandleFunc("/api/v1/agent/enroll", func(w http.ResponseWriter, r *http.Request) {
 		handleEnroll(w, r, registrar, logger)
+	})
+
+	mux.HandleFunc("/api/v1/operator/login", func(w http.ResponseWriter, r *http.Request) {
+		handleOperatorLogin(w, r, opBackend, loginLimiter, logger)
+	})
+
+	mux.HandleFunc("/api/v1/operator/me", func(w http.ResponseWriter, r *http.Request) {
+		handleOperatorMe(w, r, opBackend, logger)
+	})
+
+	mux.HandleFunc("/api/v1/operator/logout", func(w http.ResponseWriter, r *http.Request) {
+		handleOperatorLogout(w, r, opBackend, logger)
+	})
+
+	mux.HandleFunc("/api/v1/operator/audit", func(w http.ResponseWriter, r *http.Request) {
+		handleOperatorAudit(w, r, opBackend, logger)
 	})
 
 	return mux
@@ -670,6 +980,7 @@ type runtimeBackend interface {
 	readinessChecker
 	enrollmentRegistrar
 	agentAuthenticator
+	operatorBackend
 }
 
 // Run starts the controller components and blocks until ctx is canceled.

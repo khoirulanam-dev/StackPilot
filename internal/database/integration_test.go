@@ -7,19 +7,22 @@ import (
 	"crypto/rand"
 	"database/sql"
 	"errors"
+	"fmt"
 	"os"
 	"strings"
 	"testing"
 	"time"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
 )
 
 func TestPostgreSQLIntegration(t *testing.T) {
 	testURL, ok := os.LookupEnv("STACKPILOT_TEST_DATABASE_URL")
 	if !ok || testURL == "" {
-		t.Skip("skipping integration test: STACKPILOT_TEST_DATABASE_URL not set")
+		t.Log("PostgreSQL integration SKIPPED")
+		t.Skip("PostgreSQL integration SKIPPED: STACKPILOT_TEST_DATABASE_URL not set")
 	}
 
 	ctx, cancel := context.WithTimeout(context.Background(), 30*time.Second)
@@ -51,14 +54,14 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatal("expected schema 'stackpilot' to exist, but it was not found")
 	}
 
-	// 5. Verify migration version is 6 (migrations 001-006 applied)
+	// 5. Verify migration version is 9 (migrations 001-009 applied)
 	var version int32
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("expected schema version 6, got %d", version)
+	if version != 9 {
+		t.Fatalf("expected schema version 9, got %d", version)
 	}
 
 	// 6. Run db.Migrate() a second time (idempotency check)
@@ -67,13 +70,13 @@ func TestPostgreSQLIntegration(t *testing.T) {
 		t.Fatalf("second db.Migrate() failed: %v", err)
 	}
 
-	// 7. Verify version remains 6
+	// 7. Verify version remains 9
 	err = db.pool.QueryRow(ctx, "SELECT version FROM public.stackpilot_schema_version").Scan(&version)
 	if err != nil {
 		t.Fatalf("failed to query schema version after second run: %v", err)
 	}
-	if version != 6 {
-		t.Fatalf("expected schema version to remain 6, got %d", version)
+	if version != 9 {
+		t.Fatalf("expected schema version to remain 9, got %d", version)
 	}
 
 	// 8. Verify table columns in stackpilot.enrollment_tokens (plaintext storage verification)
@@ -969,4 +972,195 @@ func TestPostgreSQLIntegration(t *testing.T) {
 	if startTime.After(time.Now().Add(5 * time.Second)) {
 		t.Errorf("startTime out of reasonable range")
 	}
+
+	adminUsername := fmt.Sprintf("admin-%d", time.Now().UnixNano())
+	adminPW := "Correct-Horse-Battery-Staple-123!"
+	adminHash, err := operator.HashPassword(adminPW)
+	if err != nil {
+		t.Fatalf("failed to hash admin password: %v", err)
+	}
+
+	adminOp, err := db.CreateOperator(ctx, adminUsername, adminHash, operator.RoleAdmin)
+	if err != nil {
+		t.Fatalf("failed to create admin operator: %v", err)
+	}
+
+	if adminOp.Username != adminUsername {
+		t.Fatalf("expected canonical username %q, got %q", adminUsername, adminOp.Username)
+	}
+	if adminOp.Role != operator.RoleAdmin {
+		t.Fatalf("expected role admin, got %q", adminOp.Role)
+	}
+	if !strings.HasPrefix(adminOp.PasswordHash, "$argon2id$v=19$m=32768,t=3,p=1$") {
+		t.Fatalf("expected argon2id PHC hash, got %q", adminOp.PasswordHash)
+	}
+	if strings.Contains(adminOp.PasswordHash, adminPW) {
+		t.Fatal("plaintext password leaked into password_hash")
+	}
+
+	_, err = db.CreateOperator(ctx, adminUsername, adminHash, operator.RoleAdmin)
+	if err == nil {
+		t.Fatal("expected duplicate username to fail, got nil")
+	}
+	if !errors.Is(err, operator.ErrUsernameConflict) {
+		t.Fatalf("expected ErrUsernameConflict, got %v", err)
+	}
+
+	viewerUsername := fmt.Sprintf("viewer-%d", time.Now().UnixNano())
+	viewerHash, err := operator.HashPassword("Another-Valid-Password-123!")
+	if err != nil {
+		t.Fatalf("failed to hash viewer password: %v", err)
+	}
+	viewerOp, err := db.CreateOperator(ctx, viewerUsername, viewerHash, operator.RoleViewer)
+	if err != nil {
+		t.Fatalf("failed to create viewer operator: %v", err)
+	}
+
+	opUsername := fmt.Sprintf("operator-%d", time.Now().UnixNano())
+	opHash, err := operator.HashPassword("Another-Valid-Password-456!")
+	if err != nil {
+		t.Fatalf("failed to hash operator password: %v", err)
+	}
+	operatorOp, err := db.CreateOperator(ctx, opUsername, opHash, operator.RoleOperator)
+	if err != nil {
+		t.Fatalf("failed to create operator: %v", err)
+	}
+
+	fetchedAdmin, err := db.GetOperatorByUsername(ctx, adminUsername)
+	if err != nil {
+		t.Fatalf("GetOperatorByUsername failed: %v", err)
+	}
+	if fetchedAdmin.ID != adminOp.ID || fetchedAdmin.Role != operator.RoleAdmin {
+		t.Fatalf("fetched admin operator mismatch: %+v", fetchedAdmin)
+	}
+
+	// Security invariant: Corrupt database role must fail closed and return safe error without exposing password hash.
+	corruptUsername := fmt.Sprintf("corrupt-%d", time.Now().UnixNano())
+	corruptHash, _ := operator.HashPassword("ValidPassword123!")
+	corruptOp, err := db.CreateOperator(ctx, corruptUsername, corruptHash, operator.RoleOperator)
+	if err != nil {
+		t.Fatalf("failed to create operator for corrupt role test: %v", err)
+	}
+	_, err = db.pool.Exec(ctx, "ALTER TABLE stackpilot.operators DROP CONSTRAINT operators_role_check")
+	if err == nil {
+		_, _ = db.pool.Exec(ctx, "UPDATE stackpilot.operators SET role = 'corrupt' WHERE id = $1::uuid", corruptOp.ID)
+		_, corruptErr := db.GetOperatorByUsername(ctx, corruptUsername)
+		if corruptErr == nil || !strings.Contains(corruptErr.Error(), "corrupt operator role") {
+			t.Fatalf("expected GetOperatorByUsername to fail with corrupt operator role, got %v", corruptErr)
+		}
+		_, _ = db.pool.Exec(ctx, "UPDATE stackpilot.operators SET role = 'operator' WHERE id = $1::uuid", corruptOp.ID)
+		_, _ = db.pool.Exec(ctx, "ALTER TABLE stackpilot.operators ADD CONSTRAINT operators_role_check CHECK (role IN ('viewer', 'operator', 'admin'))")
+	}
+
+	sessTokens := make([]string, 10)
+	for i := 0; i < 10; i++ {
+		tok, err := operator.GenerateSessionToken()
+		if err != nil {
+			t.Fatalf("failed to generate session token: %v", err)
+		}
+		sessTokens[i] = tok
+		tokHash := operator.HashSessionToken(tok)
+		sess, err := db.CreateOperatorSession(ctx, adminOp.ID, tokHash)
+		if err != nil {
+			t.Fatalf("failed to create session %d: %v", i, err)
+		}
+		expectedExpiry := time.Now().Add(operator.SessionLifetime)
+		diff := sess.ExpiresAt.Sub(expectedExpiry)
+		if diff < -30*time.Second || diff > 30*time.Second {
+			t.Fatalf("session expires_at %v deviates from expected DB now + SessionLifetime %v by %v", sess.ExpiresAt, expectedExpiry, diff)
+		}
+	}
+
+	var activeCount int
+	err = db.pool.QueryRow(ctx, "SELECT count(*) FROM stackpilot.operator_sessions WHERE operator_id = $1::uuid AND expires_at > now()", adminOp.ID).Scan(&activeCount)
+	if err != nil {
+		t.Fatalf("failed to count active sessions: %v", err)
+	}
+	if activeCount != operator.MaxActiveSessionsPerOperator {
+		t.Fatalf("expected exactly %d active sessions, got %d", operator.MaxActiveSessionsPerOperator, activeCount)
+	}
+
+	for i := 0; i < 2; i++ {
+		h := operator.HashSessionToken(sessTokens[i])
+		p, err := db.FindOperatorSessionByTokenHash(ctx, h)
+		if err == nil || p != nil {
+			t.Fatalf("expected pruned session %d to be revoked, got principal %+v", i, p)
+		}
+	}
+
+	newestHash := operator.HashSessionToken(sessTokens[9])
+	principal, err := db.FindOperatorSessionByTokenHash(ctx, newestHash)
+	if err != nil {
+		t.Fatalf("failed to find active session by token hash: %v", err)
+	}
+	if principal.OperatorID != adminOp.ID || principal.Username != adminOp.Username || principal.Role != operator.RoleAdmin {
+		t.Fatalf("unexpected principal: %+v", principal)
+	}
+
+	// Security invariant: Verify TOCTOU race prevention inside session transaction when operator is disabled.
+	disabledUsername := fmt.Sprintf("disabled-%d", time.Now().UnixNano())
+	disabledHash, _ := operator.HashPassword("ValidPassword123!")
+	disabledOp, err := db.CreateOperator(ctx, disabledUsername, disabledHash, operator.RoleOperator)
+	if err != nil {
+		t.Fatalf("failed to create operator for TOCTOU test: %v", err)
+	}
+	if _, err := db.pool.Exec(ctx, "UPDATE stackpilot.operators SET disabled_at = now() WHERE id = $1::uuid", disabledOp.ID); err != nil {
+		t.Fatalf("failed to disable operator: %v", err)
+	}
+	disTok, _ := operator.GenerateSessionToken()
+	_, disErr := db.CreateOperatorSession(ctx, disabledOp.ID, operator.HashSessionToken(disTok))
+	if !errors.Is(disErr, operator.ErrAuthenticationFailed) {
+		t.Fatalf("expected ErrAuthenticationFailed for disabled operator in CreateOperatorSession, got: %v", disErr)
+	}
+
+	// Security invariant: RevokeOperatorSession must fail and omit audit if operatorID does not own session.
+	err = db.RevokeOperatorSession(ctx, principal.SessionID, viewerOp.ID, viewerOp.Username)
+	if !errors.Is(err, operator.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound when revoking session with wrong operator ID, got: %v", err)
+	}
+
+	err = db.RevokeOperatorSession(ctx, "018f0000-0000-7000-8000-000000000000", adminOp.ID, adminOp.Username)
+	if !errors.Is(err, operator.ErrSessionNotFound) {
+		t.Fatalf("expected ErrSessionNotFound for non-existent session ID, got: %v", err)
+	}
+
+	err = db.RevokeOperatorSession(ctx, principal.SessionID, adminOp.ID, adminOp.Username)
+	if err != nil {
+		t.Fatalf("failed to revoke session: %v", err)
+	}
+
+	pAfterLogout, err := db.FindOperatorSessionByTokenHash(ctx, newestHash)
+	if err == nil || pAfterLogout != nil {
+		t.Fatal("expected revoked session to fail authentication, got principal")
+	}
+
+	auditEvents, err := db.RecordAndListAuditEvents(ctx, adminOp.ID, adminOp.Username, 100)
+	if err != nil {
+		t.Fatalf("RecordAndListAuditEvents failed: %v", err)
+	}
+	if len(auditEvents) == 0 {
+		t.Fatal("expected audit events, got 0")
+	}
+
+	actionCounts := make(map[operator.AuditAction]int)
+	for _, ev := range auditEvents {
+		actionCounts[ev.Action]++
+		if ev.Outcome != operator.OutcomeSuccess {
+			t.Errorf("expected outcome success, got %q", ev.Outcome)
+		}
+	}
+	if actionCounts[operator.ActionOperatorCreated] < 4 {
+		t.Errorf("expected at least 4 operator.created events, got %d", actionCounts[operator.ActionOperatorCreated])
+	}
+	if actionCounts[operator.ActionOperatorLogin] < 10 {
+		t.Errorf("expected at least 10 operator.login events, got %d", actionCounts[operator.ActionOperatorLogin])
+	}
+	if actionCounts[operator.ActionOperatorLogout] < 1 {
+		t.Errorf("expected at least 1 operator.logout event, got %d", actionCounts[operator.ActionOperatorLogout])
+	}
+	if actionCounts[operator.ActionOperatorAuditRead] < 1 {
+		t.Errorf("expected at least 1 operator.audit.read event, got %d", actionCounts[operator.ActionOperatorAuditRead])
+	}
+
+	_ = operatorOp
 }

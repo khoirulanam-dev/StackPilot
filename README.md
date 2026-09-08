@@ -5,7 +5,18 @@ StackPilot is a serious open-source infrastructure control plane designed for Li
 
 ## Current status
 **Early Development (Pre-Release)**
-StackPilot is currently in the M0.9 stage (Metrics & Runtime Telemetry Foundation). It is pre-release and **NOT** production-ready.
+StackPilot is currently in the M0.10 stage (Operator Authentication, RBAC & Audit Foundation). It is pre-release and **NOT** production-ready.
+
+Operator Security Boundary:
+- Operator identity with secure password hashing (Argon2id: memory=32MiB, iterations=3, parallelism=1)
+- Operator bootstrap CLI with password via `--password-stdin`
+- Three typed operator roles: `viewer`, `operator`, `admin`
+- Explicit RBAC permission matrix (`servers.read`, `operations.execute`, `operators.manage`, `audit.read`)
+- Opaque random session tokens (`sp_session_...`) stored only as SHA-256 hashes
+- Local-only loopback HTTP operator API (`127.0.0.1` / `[::1]`)
+- Session management: 12-hour absolute lifetime, max 8 active sessions per operator
+- Immutable, append-only operator audit log (`operator.created`, `operator.login`, `operator.logout`, `operator.audit.read`)
+- Privileged admin-only audit read endpoint with bounded pagination (`limit` 1..200, default 100)
 
 Collected server inventory (current snapshot only):
 - Hostname
@@ -31,9 +42,9 @@ Telemetry behavior:
 
 Strict boundaries:
 - Pre-release and not production-ready
-- No historical monitoring or time-series database
-- No commands or jobs
-- No UI or dashboards
+- No UI, web control plane, or dashboards yet
+- No SSO, OIDC, SAML, LDAP, or MFA yet
+- No server operations, job execution, or remote shell yet
 - No application orchestration yet
 
 ## Development
@@ -71,6 +82,22 @@ Remote listener properties:
 - Disabled by default
 - TLS 1.3 minimum
 - Requests client certificate for agent authentication (`/api/v1/agent/self`)
+
+### Operator Bootstrap CLI
+
+Initial operators are created explicitly via the controller CLI:
+
+```bash
+printf '%s\n' '<strong-password>' | \
+stackpilot-controller operator create \
+  --username admin \
+  --role admin \
+  --password-stdin
+```
+
+- `--password-stdin`: Required. Password must be supplied via stdin (minimum 12 bytes, maximum 128 bytes, valid UTF-8, no control characters).
+- `--role`: Required. Must be one of `viewer`, `operator`, or `admin`.
+- `--username`: Required. Canonical lowercase ASCII (3..64 characters, `^[a-z0-9][a-z0-9._-]{2,63}$`).
 
 ### Agent Enrollment & Transport Check
 

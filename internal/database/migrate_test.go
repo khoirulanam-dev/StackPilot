@@ -11,8 +11,8 @@ func TestEmbeddedMigrations(t *testing.T) {
 		t.Fatalf("getEmbeddedMigrations() failed: %v", err)
 	}
 
-	if len(migrations) != 6 {
-		t.Fatalf("expected exactly 6 migrations, got %d", len(migrations))
+	if len(migrations) != 9 {
+		t.Fatalf("expected exactly 9 migrations, got %d", len(migrations))
 	}
 
 	// Verify exact migration order
@@ -22,6 +22,9 @@ func TestEmbeddedMigrations(t *testing.T) {
 	expected004 := "004_add_agent_presence.sql"
 	expected005 := "005_create_agent_inventory.sql"
 	expected006 := "006_create_agent_telemetry.sql"
+	expected007 := "007_create_operators.sql"
+	expected008 := "008_create_operator_sessions.sql"
+	expected009 := "009_create_operator_audit_events.sql"
 
 	if migrations[0] != expected001 {
 		t.Errorf("expected first migration %q, got %q", expected001, migrations[0])
@@ -40,6 +43,15 @@ func TestEmbeddedMigrations(t *testing.T) {
 	}
 	if migrations[5] != expected006 {
 		t.Errorf("expected sixth migration %q, got %q", expected006, migrations[5])
+	}
+	if migrations[6] != expected007 {
+		t.Errorf("expected seventh migration %q, got %q", expected007, migrations[6])
+	}
+	if migrations[7] != expected008 {
+		t.Errorf("expected eighth migration %q, got %q", expected008, migrations[7])
+	}
+	if migrations[8] != expected009 {
+		t.Errorf("expected ninth migration %q, got %q", expected009, migrations[8])
 	}
 
 	// Verify migration 001 contents
@@ -293,6 +305,111 @@ func TestEmbeddedMigrations(t *testing.T) {
 	parts006 := strings.Split(sql006, "---- create above / drop below ----")
 	if len(parts006) == 2 && strings.Contains(strings.ToLower(parts006[1]), "cascade") {
 		t.Errorf("migration 006 drop statement must not use CASCADE: %s", parts006[1])
+	}
+
+	// Verify migration 007 contents
+	content007, err := migrationsFS.ReadFile("migrations/" + expected007)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected007, err)
+	}
+	sql007 := string(content007)
+	requiredClauses007 := []string{
+		"CREATE TABLE stackpilot.operators",
+		"id uuid PRIMARY KEY DEFAULT uuidv7()",
+		"username text NOT NULL UNIQUE",
+		"password_hash text NOT NULL",
+		"role text NOT NULL",
+		"disabled_at timestamptz NULL",
+		"created_at timestamptz NOT NULL DEFAULT now()",
+		"updated_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT operators_username_length CHECK (char_length(username) >= 3 AND char_length(username) <= 64)",
+		"CONSTRAINT operators_username_format CHECK (username ~ '^[a-z0-9][a-z0-9._-]{2,63}$')",
+		"CONSTRAINT operators_password_hash_length CHECK (char_length(password_hash) >= 50 AND char_length(password_hash) <= 256)",
+		"CONSTRAINT operators_role_check CHECK (role IN ('viewer', 'operator', 'admin'))",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.operators;",
+	}
+	for _, clause := range requiredClauses007 {
+		if !strings.Contains(sql007, clause) {
+			t.Errorf("migration 007 missing required clause %q", clause)
+		}
+	}
+	parts007 := strings.Split(sql007, "---- create above / drop below ----")
+	if len(parts007) == 2 && strings.Contains(strings.ToLower(parts007[1]), "cascade") {
+		t.Errorf("migration 007 drop statement must not use CASCADE: %s", parts007[1])
+	}
+	if strings.Contains(strings.ToLower(sql007), "citext") {
+		t.Errorf("migration 007 must not use CITEXT: %s", sql007)
+	}
+
+	// Verify migration 008 contents
+	content008, err := migrationsFS.ReadFile("migrations/" + expected008)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected008, err)
+	}
+	sql008 := string(content008)
+	requiredClauses008 := []string{
+		"CREATE TABLE stackpilot.operator_sessions",
+		"id uuid PRIMARY KEY DEFAULT uuidv7()",
+		"operator_id uuid NOT NULL REFERENCES stackpilot.operators(id) ON DELETE CASCADE",
+		"token_hash bytea NOT NULL UNIQUE",
+		"created_at timestamptz NOT NULL DEFAULT now()",
+		"expires_at timestamptz NOT NULL",
+		"CONSTRAINT operator_sessions_token_hash_length CHECK (octet_length(token_hash) = 32)",
+		"CONSTRAINT operator_sessions_expires_at_check CHECK (expires_at > created_at)",
+		"CREATE INDEX operator_sessions_operator_id_idx ON stackpilot.operator_sessions(operator_id);",
+		"CREATE INDEX operator_sessions_expires_at_idx ON stackpilot.operator_sessions(expires_at);",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.operator_sessions;",
+	}
+	for _, clause := range requiredClauses008 {
+		if !strings.Contains(sql008, clause) {
+			t.Errorf("migration 008 missing required clause %q", clause)
+		}
+	}
+	parts008 := strings.Split(sql008, "---- create above / drop below ----")
+	if len(parts008) == 2 && strings.Contains(strings.ToLower(parts008[1]), "cascade") {
+		t.Errorf("migration 008 drop statement must not use CASCADE: %s", parts008[1])
+	}
+
+	// Verify migration 009 contents
+	content009, err := migrationsFS.ReadFile("migrations/" + expected009)
+	if err != nil {
+		t.Fatalf("failed to read %s: %v", expected009, err)
+	}
+	sql009 := string(content009)
+	requiredClauses009 := []string{
+		"CREATE TABLE stackpilot.operator_audit_events",
+		"id uuid PRIMARY KEY DEFAULT uuidv7()",
+		"actor_operator_id uuid NULL REFERENCES stackpilot.operators(id) ON DELETE SET NULL",
+		"actor_username text NOT NULL",
+		"action text NOT NULL",
+		"target_operator_id uuid NULL REFERENCES stackpilot.operators(id) ON DELETE SET NULL",
+		"target_username text NULL",
+		"outcome text NOT NULL",
+		"occurred_at timestamptz NOT NULL DEFAULT now()",
+		"CONSTRAINT operator_audit_events_actor_username_length CHECK (char_length(actor_username) >= 1 AND char_length(actor_username) <= 64)",
+		"CONSTRAINT operator_audit_events_action_length CHECK (char_length(action) >= 1 AND char_length(action) <= 64)",
+		"CONSTRAINT operator_audit_events_action_format CHECK (action ~ '^[a-z0-9._-]+$')",
+		"CONSTRAINT operator_audit_events_target_username_length CHECK (target_username IS NULL OR (char_length(target_username) >= 1 AND char_length(target_username) <= 64))",
+		"CONSTRAINT operator_audit_events_outcome_check CHECK (outcome IN ('success', 'failure', 'denied'))",
+		"CREATE INDEX operator_audit_events_occurred_at_idx ON stackpilot.operator_audit_events(occurred_at DESC, id DESC);",
+		"CREATE INDEX operator_audit_events_actor_operator_id_idx ON stackpilot.operator_audit_events(actor_operator_id);",
+		"---- create above / drop below ----",
+		"DROP TABLE stackpilot.operator_audit_events;",
+	}
+	for _, clause := range requiredClauses009 {
+		if !strings.Contains(sql009, clause) {
+			t.Errorf("migration 009 missing required clause %q", clause)
+		}
+	}
+	parts009 := strings.Split(sql009, "---- create above / drop below ----")
+	if len(parts009) == 2 && strings.Contains(strings.ToLower(parts009[1]), "cascade") {
+		t.Errorf("migration 009 drop statement must not use CASCADE: %s", parts009[1])
+	}
+	normalized009 := strings.ToLower(sql009)
+	if strings.Contains(normalized009, "json") {
+		t.Errorf("migration 009 must not contain JSON/JSONB: %s", sql009)
 	}
 }
 

@@ -28,6 +28,7 @@ import (
 
 	"stackpilot/internal/agent"
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
 )
 
@@ -146,6 +147,31 @@ func (f *fakeAuthBackend) RecordAgentTelemetry(ctx context.Context, publicKey [3
 
 func (f *fakeAuthBackend) Ping(ctx context.Context) error {
 	return nil
+}
+
+func (f *fakeAuthBackend) GetOperatorByUsername(ctx context.Context, username string) (*operator.OperatorRecord, error) {
+	return nil, operator.ErrOperatorNotFound
+}
+
+func (f *fakeAuthBackend) CreateOperatorSession(ctx context.Context, operatorID string, tokenHash [32]byte) (*operator.SessionRecord, error) {
+	return &operator.SessionRecord{
+		ID:         "018f0000-0000-7000-8000-000000000099",
+		OperatorID: operatorID,
+		CreatedAt:  time.Now(),
+		ExpiresAt:  time.Now().Add(12 * time.Hour),
+	}, nil
+}
+
+func (f *fakeAuthBackend) FindOperatorSessionByTokenHash(ctx context.Context, tokenHash [32]byte) (*operator.Principal, error) {
+	return nil, operator.ErrAuthenticationFailed
+}
+
+func (f *fakeAuthBackend) RevokeOperatorSession(ctx context.Context, sessionID string, operatorID string, username string) error {
+	return nil
+}
+
+func (f *fakeAuthBackend) RecordAndListAuditEvents(ctx context.Context, actorOperatorID string, actorUsername string, limit int) ([]operator.AuditEventRecord, error) {
+	return []operator.AuditEventRecord{}, nil
 }
 
 func helperGenerateEd25519Cert(t *testing.T, notBefore, notAfter time.Time, extKeyUsage []x509.ExtKeyUsage, cn string, sanDNS []string) (ed25519.PublicKey, ed25519.PrivateKey, *x509.Certificate) {

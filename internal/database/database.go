@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"stackpilot/internal/enrollment"
+	"stackpilot/internal/operator"
 	"stackpilot/internal/protocol"
 )
 
@@ -476,6 +477,385 @@ func (db *DB) RecordAgentTelemetry(ctx context.Context, publicKey [32]byte, req 
 	}
 
 	return nil
+}
+
+// CreateOperator creates a new operator and records an audit event atomically.
+func (db *DB) CreateOperator(ctx context.Context, username, passwordHash string, role operator.Role) (*operator.OperatorRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	username = operator.NormalizeUsername(username)
+	if err := operator.ValidateUsername(username); err != nil {
+		return nil, err
+	}
+	if !role.Valid() {
+		return nil, fmt.Errorf("invalid operator role: %q", role)
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin transaction: %w", sanitizeError(err))
+	}
+	defer tx.Rollback(ctx)
+
+	const insertOpQuery = `
+		INSERT INTO stackpilot.operators (username, password_hash, role)
+		VALUES ($1, $2, $3)
+		RETURNING id::text, username, password_hash, role, disabled_at, created_at, updated_at
+	`
+
+	var record operator.OperatorRecord
+	var roleStr string
+	err = tx.QueryRow(ctx, insertOpQuery, username, passwordHash, string(role)).Scan(
+		&record.ID,
+		&record.Username,
+		&record.PasswordHash,
+		&roleStr,
+		&record.DisabledAt,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		var pgErr *pgconn.PgError
+		if errors.As(err, &pgErr) && pgErr.Code == "23505" {
+			return nil, operator.ErrUsernameConflict
+		}
+		return nil, fmt.Errorf("failed to insert operator: %w", sanitizeError(err))
+	}
+	record.Role = operator.Role(roleStr)
+
+	const insertAuditQuery = `
+		INSERT INTO stackpilot.operator_audit_events (
+			actor_operator_id, actor_username, action, target_operator_id, target_username, outcome
+		) VALUES (
+			NULL, 'system', $1, $2, $3, $4
+		)
+	`
+	_, err = tx.Exec(ctx, insertAuditQuery,
+		string(operator.ActionOperatorCreated),
+		record.ID,
+		record.Username,
+		string(operator.OutcomeSuccess),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to record operator creation audit event: %w", sanitizeError(err))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit operator creation: %w", sanitizeError(err))
+	}
+
+	return &record, nil
+}
+
+// GetOperatorByUsername retrieves an operator record by username for credential verification.
+func (db *DB) GetOperatorByUsername(ctx context.Context, username string) (*operator.OperatorRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	username = operator.NormalizeUsername(username)
+	const query = `
+		SELECT id::text, username, password_hash, role, disabled_at, created_at, updated_at
+		FROM stackpilot.operators
+		WHERE username = $1
+	`
+
+	var record operator.OperatorRecord
+	var roleStr string
+	err := db.pool.QueryRow(ctx, query, username).Scan(
+		&record.ID,
+		&record.Username,
+		&record.PasswordHash,
+		&roleStr,
+		&record.DisabledAt,
+		&record.CreatedAt,
+		&record.UpdatedAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, operator.ErrOperatorNotFound
+		}
+		return nil, fmt.Errorf("failed to query operator: %w", sanitizeError(err))
+	}
+	role, err := operator.ParseRole(roleStr)
+	if err != nil {
+		return nil, fmt.Errorf("corrupt operator role: %w", sanitizeError(err))
+	}
+	record.Role = role
+	return &record, nil
+}
+
+// CreateOperatorSession serializes concurrent session creations, verifies enabled status, bounds active sessions,
+// and records the login audit event atomically.
+func (db *DB) CreateOperatorSession(ctx context.Context, operatorID string, tokenHash [32]byte) (*operator.SessionRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin session transaction: %w", sanitizeError(err))
+	}
+	defer tx.Rollback(ctx)
+
+	// Lock operator row to eliminate TOCTOU race: verify account remains active and derive canonical username.
+	var (
+		lockedID          string
+		canonicalUsername string
+	)
+	err = tx.QueryRow(ctx, `SELECT id::text, username FROM stackpilot.operators WHERE id = $1 AND disabled_at IS NULL FOR UPDATE`, operatorID).Scan(&lockedID, &canonicalUsername)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, operator.ErrAuthenticationFailed
+		}
+		return nil, fmt.Errorf("failed to lock operator record: %w", sanitizeError(err))
+	}
+
+	_, err = tx.Exec(ctx, `DELETE FROM stackpilot.operator_sessions WHERE operator_id = $1 AND expires_at <= now()`, operatorID)
+	if err != nil {
+		return nil, fmt.Errorf("failed to prune expired sessions: %w", sanitizeError(err))
+	}
+
+	retainCount := operator.MaxActiveSessionsPerOperator - 1
+	const pruneExcessQuery = `
+		DELETE FROM stackpilot.operator_sessions
+		WHERE operator_id = $1
+		  AND id NOT IN (
+			SELECT id FROM stackpilot.operator_sessions
+			WHERE operator_id = $1
+			ORDER BY created_at DESC, id DESC
+			LIMIT $2
+		  )
+	`
+	if _, err = tx.Exec(ctx, pruneExcessQuery, operatorID, retainCount); err != nil {
+		return nil, fmt.Errorf("failed to prune excess sessions: %w", sanitizeError(err))
+	}
+
+	lifetimeSeconds := int64(operator.SessionLifetime / time.Second)
+	const insertSessionQuery = `
+		INSERT INTO stackpilot.operator_sessions (operator_id, token_hash, expires_at)
+		VALUES ($1, $2, now() + ($3 * interval '1 second'))
+		RETURNING id::text, operator_id::text, created_at, expires_at
+	`
+	var sessionRec operator.SessionRecord
+	err = tx.QueryRow(ctx, insertSessionQuery, operatorID, tokenHash[:], lifetimeSeconds).Scan(
+		&sessionRec.ID,
+		&sessionRec.OperatorID,
+		&sessionRec.CreatedAt,
+		&sessionRec.ExpiresAt,
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to insert session: %w", sanitizeError(err))
+	}
+
+	const insertAuditQuery = `
+		INSERT INTO stackpilot.operator_audit_events (
+			actor_operator_id, actor_username, action, target_operator_id, target_username, outcome
+		) VALUES (
+			$1, $2, $3, $1, $2, $4
+		)
+	`
+	_, err = tx.Exec(ctx, insertAuditQuery,
+		operatorID,
+		canonicalUsername,
+		string(operator.ActionOperatorLogin),
+		string(operator.OutcomeSuccess),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to record login audit event: %w", sanitizeError(err))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit session transaction: %w", sanitizeError(err))
+	}
+
+	return &sessionRec, nil
+}
+
+// FindOperatorSessionByTokenHash queries the active session and joined operator identity in a single round-trip.
+func (db *DB) FindOperatorSessionByTokenHash(ctx context.Context, tokenHash [32]byte) (*operator.Principal, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+
+	const query = `
+		SELECT
+			o.id::text,
+			o.username,
+			o.role,
+			s.id::text,
+			s.expires_at
+		FROM stackpilot.operator_sessions s
+		JOIN stackpilot.operators o ON s.operator_id = o.id
+		WHERE s.token_hash = $1
+		  AND s.expires_at > now()
+		  AND o.disabled_at IS NULL
+	`
+
+	var (
+		p       operator.Principal
+		roleStr string
+	)
+	err := db.pool.QueryRow(ctx, query, tokenHash[:]).Scan(
+		&p.OperatorID,
+		&p.Username,
+		&roleStr,
+		&p.SessionID,
+		&p.ExpiresAt,
+	)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return nil, operator.ErrAuthenticationFailed
+		}
+		return nil, fmt.Errorf("failed to query session: %w", sanitizeError(err))
+	}
+
+	role, err := operator.ParseRole(roleStr)
+	if err != nil {
+		return nil, operator.ErrAuthenticationFailed
+	}
+	p.Role = role
+	return &p, nil
+}
+
+// RevokeOperatorSession deletes the specified session scoped by both session ID and operator ID,
+// and records the logout audit event atomically only if the session was found and deleted.
+func (db *DB) RevokeOperatorSession(ctx context.Context, sessionID string, operatorID string, username string) error {
+	if db.pool == nil {
+		return fmt.Errorf("database pool is not initialized")
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return fmt.Errorf("failed to begin logout transaction: %w", sanitizeError(err))
+	}
+	defer tx.Rollback(ctx)
+
+	var deletedID string
+	err = tx.QueryRow(ctx, `
+		DELETE FROM stackpilot.operator_sessions
+		WHERE id = $1 AND operator_id = $2
+		RETURNING id::text
+	`, sessionID, operatorID).Scan(&deletedID)
+	if err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return operator.ErrSessionNotFound
+		}
+		return fmt.Errorf("failed to delete session: %w", sanitizeError(err))
+	}
+
+	const insertAuditQuery = `
+		INSERT INTO stackpilot.operator_audit_events (
+			actor_operator_id, actor_username, action, target_operator_id, target_username, outcome
+		) VALUES (
+			$1, $2, $3, NULL, NULL, $4
+		)
+	`
+	_, err = tx.Exec(ctx, insertAuditQuery,
+		operatorID,
+		username,
+		string(operator.ActionOperatorLogout),
+		string(operator.OutcomeSuccess),
+	)
+	if err != nil {
+		return fmt.Errorf("failed to record logout audit event: %w", sanitizeError(err))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return fmt.Errorf("failed to commit logout transaction: %w", sanitizeError(err))
+	}
+	return nil
+}
+
+// RecordAndListAuditEvents records the operator.audit.read event before listing historical audit records.
+func (db *DB) RecordAndListAuditEvents(ctx context.Context, actorOperatorID string, actorUsername string, limit int) ([]operator.AuditEventRecord, error) {
+	if db.pool == nil {
+		return nil, fmt.Errorf("database pool is not initialized")
+	}
+	if limit <= 0 || limit > 200 {
+		return nil, fmt.Errorf("invalid audit limit: %d", limit)
+	}
+
+	tx, err := db.pool.Begin(ctx)
+	if err != nil {
+		return nil, fmt.Errorf("failed to begin audit read transaction: %w", sanitizeError(err))
+	}
+	defer tx.Rollback(ctx)
+
+	const insertAuditQuery = `
+		INSERT INTO stackpilot.operator_audit_events (
+			actor_operator_id, actor_username, action, target_operator_id, target_username, outcome
+		) VALUES (
+			$1, $2, $3, NULL, NULL, $4
+		)
+	`
+	_, err = tx.Exec(ctx, insertAuditQuery,
+		actorOperatorID,
+		actorUsername,
+		string(operator.ActionOperatorAuditRead),
+		string(operator.OutcomeSuccess),
+	)
+	if err != nil {
+		return nil, fmt.Errorf("failed to record audit read event: %w", sanitizeError(err))
+	}
+
+	const listAuditQuery = `
+		SELECT
+			id::text,
+			occurred_at,
+			actor_operator_id::text,
+			actor_username,
+			action,
+			target_operator_id::text,
+			target_username,
+			outcome
+		FROM stackpilot.operator_audit_events
+		ORDER BY occurred_at DESC, id DESC
+		LIMIT $1
+	`
+	rows, err := tx.Query(ctx, listAuditQuery, limit)
+	if err != nil {
+		return nil, fmt.Errorf("failed to query audit events: %w", sanitizeError(err))
+	}
+	defer rows.Close()
+
+	var events []operator.AuditEventRecord
+	for rows.Next() {
+		var ev operator.AuditEventRecord
+		var actStr, outStr string
+		var actorID, targetID *string
+		if err := rows.Scan(
+			&ev.ID,
+			&ev.OccurredAt,
+			&actorID,
+			&ev.ActorUsername,
+			&actStr,
+			&targetID,
+			&ev.TargetUsername,
+			&outStr,
+		); err != nil {
+			return nil, fmt.Errorf("failed to scan audit event: %w", sanitizeError(err))
+		}
+		ev.ActorOperatorID = actorID
+		ev.TargetOperatorID = targetID
+		ev.Action = operator.AuditAction(actStr)
+		ev.Outcome = operator.AuditOutcome(outStr)
+		events = append(events, ev)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, fmt.Errorf("error iterating audit events: %w", sanitizeError(err))
+	}
+
+	if err := tx.Commit(ctx); err != nil {
+		return nil, fmt.Errorf("failed to commit audit read transaction: %w", sanitizeError(err))
+	}
+
+	if events == nil {
+		events = []operator.AuditEventRecord{}
+	}
+	return events, nil
 }
 
 var (
